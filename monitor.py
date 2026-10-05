@@ -91,28 +91,25 @@ def run_inspection():
         print(f"==================================================")
 
         with sync_playwright() as p:
-            launch_args = [
-                "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-                "--ignore-certificate-errors", "--disable-http2", "--window-size=1920,1080"
-            ]
-            launch_opts = {"headless": True, "args": launch_args}
+            # USING FIREFOX to stop the proxy connection drops!
+            launch_opts = {"headless": True}
             if proxy:
                 launch_opts["proxy"] = {"server": proxy}
 
-            browser = p.chromium.launch(**launch_opts)
+            browser = p.firefox.launch(**launch_opts)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
                 viewport={"width": 1920, "height": 1080},
                 ignore_https_errors=True
             )
             page = context.new_page()
             
-            # MASSIVE 3-Minute Timeout to guarantee slow proxies can finish
+            # Massive 3-Minute Timeout
             page.set_default_timeout(180000)
             page.route("**/*", block_heavy_assets)
 
             # ---------------------------------------------------------
-            # 1. THE WINNING API NETWORK INTERCEPTOR (WIRETAP)
+            # 1. API NETWORK INTERCEPTOR (WIRETAP)
             # ---------------------------------------------------------
             captured_api_data = []
             
@@ -128,7 +125,8 @@ def run_inspection():
             page.on("response", intercept_api_responses)
 
             try:
-                print("Navigating to Golden Link over secure tunnel...")
+                print("Navigating to Golden Link over secure Firefox tunnel...")
+                # commit wait prevents waiting for heavy frontend assets
                 page.goto(DIRECT_URL, wait_until="commit", timeout=180000)
 
                 print("Waiting up to 90 seconds for API data packets to arrive...")
@@ -191,7 +189,7 @@ def run_inspection():
                 if timestamp_match:
                     raw_ts_str = timestamp_match.group(0).strip()
                     try:
-                        # Try strict YYYY-MM-DD parsing first to avoid Day/Month swaps
+                        # Try strict YYYY-MM-DD parsing first
                         try:
                             parsed_dt = datetime.strptime(raw_ts_str, "%Y-%m-%d %H:%M")
                         except ValueError:
