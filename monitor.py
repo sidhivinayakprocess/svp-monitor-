@@ -64,7 +64,6 @@ def test_proxy_handshake(proxy_ip):
             verify=False
         )
         # CRITICAL FIX: Only accept HTTP 200 Success. 
-        # CPCB returns 403 Forbidden for blocked foreign IPs, which we now reject.
         if r.status_code == 200:
             return p_url
     except Exception:
@@ -87,8 +86,7 @@ def get_verified_proxies(max_needed=3):
     return verified
 
 def abort_heavy_assets(route):
-    # Cuts data size by 70% to prevent proxy bandwidth timeouts
-    if route.request.resource_type in ["image", "media", "font"]:
+    if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
         route.abort()
     else:
         route.continue_()
@@ -105,11 +103,14 @@ def run_inspection():
         print(f"==================================================")
 
         with sync_playwright() as p:
+            # Engine-level HTTP/1.1 downgrade and rendering block
             launch_args = [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--ignore-certificate-errors",
+                "--disable-http2",  # CRITICAL: Forces cheap proxies to not drop connections
+                "--blink-settings=imagesEnabled=false", # Hard-disable images
                 "--window-size=1920,1080"
             ]
             launch_opts = {"headless": True, "args": launch_args}
@@ -123,15 +124,16 @@ def run_inspection():
                 ignore_https_errors=True
             )
             page = context.new_page()
-            page.set_default_timeout(35000)
+            page.set_default_timeout(60000)
             page.route("**/*", abort_heavy_assets)
 
             try:
                 print("Navigating to CPCB dashboard...")
-                page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=75000)
+                # wait_until='commit' stops ERR_TIMED_OUT on the initial HTML request
+                page.goto(DASHBOARD_URL, wait_until="commit", timeout=120000)
 
-                print("Waiting for grid rows to render...")
-                page.wait_for_selector("table, .ant-table, tr", timeout=45000)
+                print("Waiting for grid rows to render (Max 60 seconds)...")
+                page.wait_for_selector("table, .ant-table, tr", timeout=60000)
                 page.wait_for_timeout(6000)
 
                 print("Locating search filter inputs...")
@@ -145,7 +147,7 @@ def run_inspection():
                 for idx, field in enumerate(visible_inputs, 1):
                     print(f"Testing filter input #{idx}...")
                     try:
-                        field.click(timeout=3000)
+                        field.click(timeout=5000)
                         field.fill("")
                         field.type(TARGET_INDUSTRY, delay=40)
                         page.keyboard.press("Enter")
