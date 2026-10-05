@@ -31,10 +31,14 @@ def send_telegram(message: str):
         print(f"Telegram notification error: {e}")
 
 def fetch_indian_proxies():
+    # Massively expanded proxy sources to ensure a huge bench
     sources = [
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=IN&ssl=all&anonymity=all",
         "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
+        "https://www.proxy-list.download/api/v1/get?type=https&country=IN",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt"
     ]
     proxies = set()
     print("Scraping active Indian HTTP proxies...")
@@ -57,7 +61,7 @@ def test_proxy_handshake(proxy_url):
         pass
     return None
 
-def get_verified_proxies(max_needed=8):
+def get_verified_proxies(max_needed=12):
     candidates = fetch_indian_proxies()
     print(f"Testing {len(candidates)} candidate proxies against CPCB firewall...")
     verified = []
@@ -79,7 +83,8 @@ def block_heavy_assets(route):
         route.continue_()
 
 def run_inspection():
-    proxies = get_verified_proxies(max_needed=8)
+    # Attempt up to 12 proxies!
+    proxies = get_verified_proxies(max_needed=12)
     if not proxies:
         proxies = [None]
 
@@ -89,9 +94,12 @@ def run_inspection():
         print(f"==================================================")
 
         with sync_playwright() as p:
+            # Anti-Reset flags to prevent Chromium from DDOSing the proxy
             launch_args = [
                 "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-                "--ignore-certificate-errors", "--disable-http2", "--window-size=1920,1080"
+                "--ignore-certificate-errors", "--disable-http2", "--window-size=1920,1080",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials"
             ]
             launch_opts = {"headless": True, "args": launch_args}
             if proxy:
@@ -143,13 +151,17 @@ def run_inspection():
                 if not success:
                     print("API payload not caught yet. Ensuring Emission tab is triggered...")
                     try:
+                        # Massive wait added to ensure slow proxies load the Angular base HTML
+                        page.wait_for_selector(".ant-card, [role='tablist'], table", timeout=45000)
                         page.evaluate("""() => {
                             const tabs = Array.from(document.querySelectorAll('button, a, div, span, [role="tab"]'));
                             const emissionTab = tabs.find(el => el.textContent.trim().toUpperCase().includes('EMISSION'));
                             if (emissionTab) { emissionTab.click(); }
                         }""")
-                        page.wait_for_timeout(5000)
-                    except:
+                        print("Tab clicked! Waiting 15 full seconds for slow proxies to render the data...")
+                        page.wait_for_timeout(15000)
+                    except Exception as fallback_err:
+                        print(f"Fallback UI navigation error: {fallback_err}")
                         pass
 
                 print("Extracting parameters...")
@@ -164,7 +176,7 @@ def run_inspection():
                 routine_time = "Unknown"
 
                 if "SIDDHI" not in upper_body and "MG/M" not in upper_body:
-                    raise Exception("Proxy loaded a blank page or dropped connection. Moving to next proxy.")
+                    raise Exception("Proxy loaded a blank page or dropped connection mid-stream. Moving to next proxy.")
 
                 is_na_detected = any(pattern in upper_body for pattern in [
                     " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE", '"NA"'
@@ -178,7 +190,7 @@ def run_inspection():
 
                 if emission_numbers and not is_na_detected:
                     val = float(emission_numbers[0])
-                    routine_val = f"{val} mg/m³"  # Capture reading for the routine update
+                    routine_val = f"{val} mg/m³" 
                     if val < THRESHOLD:
                         alert_reasons.append(f"• Emission value (<b>{val} mg/m³</b>) is below {THRESHOLD} mg/m³")
                     else:
@@ -199,8 +211,7 @@ def run_inspection():
                                 parsed_dt = parser.parse(raw_ts_str)
 
                         last_received_ist = IST.localize(parsed_dt) if parsed_dt.tzinfo is None else parsed_dt.astimezone(IST)
-                        
-                        routine_time = last_received_ist.strftime('%d %b %Y, %I:%M %p') # Capture time for the routine update
+                        routine_time = last_received_ist.strftime('%d %b %Y, %I:%M %p')
                         
                         time_diff = now_ist - last_received_ist
                         delay_hours = time_diff.total_seconds() / 3600.0
@@ -220,7 +231,7 @@ def run_inspection():
                         raise Exception("Failed to extract data payload. Proxy likely dropped connection mid-stream.")
 
                 # ---------------------------------------------------------
-                # NEW ROUTINE TRIGGER LOGIC (11 AM, 3 PM, 9:30 PM)
+                # ROUTINE TRIGGER LOGIC (11 AM, 3 PM, 9:30 PM)
                 # ---------------------------------------------------------
                 is_scheduled = (now_ist.hour == 11 and now_ist.minute < 30) or \
                                (now_ist.hour == 15 and now_ist.minute < 30) or \
@@ -228,8 +239,6 @@ def run_inspection():
 
                 if alert_reasons or is_scheduled:
                     alert_time_str = now_ist.strftime("%I:%M %p (%d %b %Y)")
-                    
-                    # Switch headers depending on if it's a routine update or an actual alert
                     header = "⚠️ <b>CPCB Emission Alert</b>" if alert_reasons else "📊 <b>Scheduled Routine Update</b>"
                     
                     triggers_text = ""
