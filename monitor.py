@@ -107,11 +107,10 @@ def check_cpcb():
 
             try:
                 print("Navigating to CPCB dashboard...")
-                page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000)
+                page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=90000)
                 
                 print("Waiting for the table to load over the proxy...")
-                # If table doesn't load in 35s, proxy is too slow to download the SPA JS files.
-                page.wait_for_selector("table, .ag-root-wrapper, .mat-table, .ant-table", timeout=35000)
+                page.wait_for_selector("table, .ag-root-wrapper, .mat-table, .ant-table", timeout=45000)
                 print("Table grid detected! Letting data hydrate...")
                 page.wait_for_timeout(8000)
 
@@ -123,8 +122,7 @@ def check_cpcb():
                 visible_inputs = [inp for inp in all_inputs if inp.is_visible() and not inp.get_attribute("readonly") and not inp.get_attribute("disabled")]
                 
                 if not visible_inputs:
-                    print("Page loaded but no search boxes appeared. Proxy may have dropped chunked data.")
-                    raise Exception("Incomplete page render.")
+                    raise Exception("Page loaded but no writable search boxes appeared.")
 
                 print(f"Found {len(visible_inputs)} writable text boxes. Commencing search...")
                 
@@ -139,6 +137,7 @@ def check_cpcb():
                         
                         page.wait_for_timeout(4000) 
                         
+                        # Verify the row exists anywhere in the main table area
                         row = page.locator("tr, .mat-row, .ag-row, [role='row']", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).first
                         if row.count() > 0:
                             print(f"SUCCESS! Text box #{i+1} is the correct filter.")
@@ -152,22 +151,35 @@ def check_cpcb():
                         print(f"  -> Skipped box #{i+1}: {e}")
 
                 if not row_found:
-                    print("FAILED to find row. Moving to next proxy...")
-                    raise Exception("Target row not found.")
+                    raise Exception("Target row not found. Filter failed.")
 
                 row_text = row.inner_text()
                 
                 # ---------------------------------------------------------
-                # ACTION BUTTON CLICKER
+                # ACTION BUTTON CLICKER (BYPASSES ANT-DESIGN SPLIT TABLE)
                 # ---------------------------------------------------------
                 print("Clicking action icon...")
-                eye_btn = row.locator(".anticon-eye, [data-icon='eye'], nz-icon, .fa-eye, [title*='View' i], button, a.ant-btn").first
                 
-                if eye_btn.count() == 0:
-                    print("Could not find standard icon. Clicking the last column...")
-                    eye_btn = row.locator("td, .ant-table-cell").last.locator("a, button, svg, i").first
+                # We filter the table to 1 row, so we just blindly click the first valid view icon anywhere in the table area
+                eye_btn = page.locator(".anticon-eye, .fa-eye, [data-icon='eye'], img[src*='eye'], [title*='View' i]").first
+                
+                if eye_btn.is_visible(timeout=5000):
+                    print("Found standard Eye icon! Clicking it...")
+                    eye_btn.click(force=True)
+                else:
+                    print("No standard eye icon. Using JS to click the action button in the fixed-right column...")
+                    clicked = page.evaluate('''() => {
+                        let buttons = Array.from(document.querySelectorAll('tbody button, tbody a, .ant-table-fixed-right button, .ant-table-fixed-right a'));
+                        let visible = buttons.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
+                        if (visible.length > 0) {
+                            visible[0].click();
+                            return true;
+                        }
+                        return false;
+                    }''')
+                    if not clicked:
+                        raise Exception("Could not find any clickable elements in the table body.")
 
-                eye_btn.click(timeout=10000)
                 page.wait_for_timeout(5000)
 
                 print("Switching to Emission tab...")
@@ -197,18 +209,19 @@ def check_cpcb():
                     else:
                         print(f"Reading normal: {val} mg/m³")
 
-                time_match = re.search(r"Last received:\s*([0-9a-zA-Z\s/:-]+)", full_text, re.IGNORECASE)
+                # Parse the "Last Data Received" timestamp directly (Format: YYYY-MM-DD HH:MM)
+                time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})", full_text)
                 if time_match:
                     raw_time_str = time_match.group(1).strip()
                     try:
-                        last_time_naive = parser.parse(raw_time_str, fuzzy=True, dayfirst=True)
+                        last_time_naive = parser.parse(raw_time_str)
                         last_time_ist = IST.localize(last_time_naive)
                         now_ist = datetime.now(IST)
                         
                         time_diff = now_ist - last_time_ist
                         delay_hours = time_diff.total_seconds() / 3600
                         
-                        print(f"Parsed Time: {last_time_ist.strftime('%d %b %H:%M')} | Delay: {delay_hours:.2f} hours")
+                        print(f"Parsed Time: {last_time_ist.strftime('%Y-%m-%d %H:%M')} | Delay: {delay_hours:.2f} hours")
 
                         if delay_hours >= 1.0:
                             hrs = int(time_diff.total_seconds() // 3600)
@@ -216,6 +229,8 @@ def check_cpcb():
                             alert_reasons.append(f"• Telemetry is delayed by <b>{hrs}h {mins}m</b> (Last: {last_time_ist.strftime('%d %b %I:%M %p')})")
                     except Exception as e:
                         print(f"Could not parse timestamp '{raw_time_str}': {e}")
+                else:
+                    print("Warning: Could not locate a valid timestamp in the row or modal.")
 
                 if alert_reasons:
                     reasons_str = "\n".join(alert_reasons)
@@ -233,7 +248,6 @@ def check_cpcb():
                     print("No alert required.")
 
                 # If we reach this line, the scrape was 100% successful! 
-                # We return immediately to exit the loop and finish the workflow.
                 return 
 
             except Exception as e:
