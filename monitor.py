@@ -109,19 +109,23 @@ def check_cpcb():
             
             print("Waiting for the table to load over the proxy...")
             try:
-                page.wait_for_selector("table, .ag-root-wrapper, .mat-table, [role='grid']", timeout=45000)
-                page.wait_for_timeout(8000) # Give extra time for data to populate
+                page.wait_for_selector("table, .ag-root-wrapper, .mat-table, .ant-table", timeout=45000)
+                page.wait_for_timeout(8000)
             except:
                 print("Table grid didn't explicitly load, proceeding anyway...")
 
             # ---------------------------------------------------------
-            # 2. SELF-HEALING SEARCH ENGINE
+            # 2. UPGRADED SEARCH ENGINE (Ignores NG-Zorro Dropdowns)
             # ---------------------------------------------------------
-            print("Locating all search inputs on the page...")
+            print("Locating all valid search inputs on the page...")
             all_inputs = page.locator("input").all()
-            visible_inputs = [inp for inp in all_inputs if inp.is_visible()]
+            visible_inputs = []
+            for inp in all_inputs:
+                # Exclude readonly dropdowns (like the one that failed earlier)
+                if inp.is_visible() and not inp.get_attribute("readonly") and not inp.get_attribute("disabled"):
+                    visible_inputs.append(inp)
             
-            print(f"Found {len(visible_inputs)} text boxes. Commencing guess-and-check filter...")
+            print(f"Found {len(visible_inputs)} writable text boxes. Commencing search...")
             
             row_found = False
             for i, current_input in enumerate(visible_inputs):
@@ -132,17 +136,14 @@ def check_cpcb():
                     current_input.type(TARGET_INDUSTRY, delay=50)
                     page.keyboard.press("Enter")
                     
-                    # Wait for Angular to redraw the table
                     page.wait_for_timeout(4000) 
                     
-                    # Check if our target row appeared
                     row = page.locator("tr, .mat-row, .ag-row, [role='row']", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).first
                     if row.count() > 0:
                         print(f"SUCCESS! Text box #{i+1} is the correct filter.")
                         row_found = True
                         break
                     else:
-                        # Revert the box and move to the next one
                         current_input.fill("")
                         page.keyboard.press("Enter")
                         page.wait_for_timeout(1000)
@@ -150,29 +151,45 @@ def check_cpcb():
                     print(f"  -> Skipped box #{i+1}: {e}")
 
             if not row_found:
-                print("FAILED to find row after testing every text box.")
-                print("Dumping visible page text for debugging:")
-                print("-" * 40)
+                print("FAILED to find row. Dumping page text:")
                 print(page.inner_text("body")[:1000])
-                print("-" * 40)
                 return
             # ---------------------------------------------------------
 
             row_text = row.inner_text()
             
-            print("Clicking eye icon...")
-            eye_btn = row.locator("button:has(.fa-eye), a:has(.fa-eye), i.fa-eye, [title*='View' i], svg").first
-            eye_btn.click(timeout=10000)
-            page.wait_for_timeout(6000)
+            # ---------------------------------------------------------
+            # 3. UPGRADED NG-ZORRO ACTION BUTTON CLICKER
+            # ---------------------------------------------------------
+            try:
+                print("Clicking action icon...")
+                # Try Ant Design icons, SVG paths, or any standard button
+                eye_btn = row.locator(".anticon-eye, [data-icon='eye'], nz-icon, .fa-eye, [title*='View' i], button, a.ant-btn").first
+                
+                if eye_btn.count() == 0:
+                    print("Could not find standard icon. Clicking the last column...")
+                    # Fallback: Find the very last cell in the row and click the button/link inside it
+                    eye_btn = row.locator("td, .ant-table-cell").last.locator("a, button, svg, i").first
+
+                eye_btn.click(timeout=10000)
+                page.wait_for_timeout(6000)
+            except Exception as e:
+                print("Failed to click the view icon.")
+                print("Dumping the row's exact HTML code so we can see the button's class:")
+                print("-" * 40)
+                print(row.inner_html()[:2000])
+                print("-" * 40)
+                return
+            # ---------------------------------------------------------
 
             print("Switching to Emission tab...")
-            emission_tab = page.locator("button:has-text('Emission'), [role='tab']:has-text('Emission'), a:has-text('Emission')").first
+            emission_tab = page.locator("button:has-text('Emission'), [role='tab']:has-text('Emission'), a:has-text('Emission'), .ant-tabs-tab:has-text('Emission')").first
             if emission_tab.is_visible(timeout=5000):
                 emission_tab.click()
                 page.wait_for_timeout(4000)
 
             # Read Modal Text
-            modal = page.locator(".modal-content, [role='dialog'], .drawer, .card").first
+            modal = page.locator(".modal-content, [role='dialog'], .drawer, .card, .ant-modal-content, .ant-drawer-content").first
             modal_text = modal.inner_text() if modal.count() > 0 else page.inner_text("body")
             full_text = f"{row_text}\n{modal_text}"
             
