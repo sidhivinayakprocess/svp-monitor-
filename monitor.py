@@ -1,6 +1,6 @@
 import os
 import re
-import socket
+import json
 import concurrent.futures
 from datetime import datetime
 import requests
@@ -11,7 +11,7 @@ import urllib3
 
 urllib3.disable_warnings()
 
-DASHBOARD_URL = "https://cems.cpcb.gov.in/public/#/l/realtime-connectivity-status-dashboard"
+DIRECT_URL = "https://cems.cpcb.gov.in/public/#/l/dashboard/site-info/eyJvYmoiOiJpbmR1c3RyeV83MjU3In0="
 TARGET_INDUSTRY = "SIDDHI VINAYAK PROCESS"
 THRESHOLD = 5.0
 DELAY_THRESHOLD_HOURS = 1.0
@@ -22,74 +22,69 @@ IST = pytz.timezone("Asia/Kolkata")
 
 def send_telegram(message: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram keys missing from environment secrets.")
+        print("Telegram keys missing.")
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         requests.post(url, json=payload, timeout=20)
     except Exception as e:
         print(f"Telegram notification error: {e}")
 
-def fetch_socks_proxies():
-    # EXCLUSIVELY scraping SOCKS4/5 proxies to bypass HTTP parsing disconnects
+def fetch_indian_proxies():
     sources = [
-        ("socks5", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=IN"),
-        ("socks4", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=IN"),
-        ("socks5", "https://www.proxy-list.download/api/v1/get?type=socks5&country=IN"),
-        ("socks4", "https://www.proxy-list.download/api/v1/get?type=socks4&country=IN")
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=IN&ssl=all&anonymity=all",
+        "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
+        "https://www.proxy-list.download/api/v1/get?type=https&country=IN",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
     ]
     proxies = set()
-    print("Scraping active Indian SOCKS5/SOCKS4 proxies...")
-    for proto, src in sources:
+    print("Scraping active Indian HTTP proxies...")
+    for src in sources:
         try:
             r = requests.get(src, timeout=8)
             if r.status_code == 200:
                 for match in re.finditer(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", r.text):
-                    proxies.add(f"{proto}://{match.group(0)}")
-        except Exception:
+                    proxies.add(f"http://{match.group(0)}")
+        except:
             continue
     return list(proxies)
 
-def test_socket_handshake(proxy_url):
-    # Tests if the SOCKS proxy port is alive and open for routing
+def test_proxy_handshake(proxy_url):
     try:
-        ip, port = proxy_url.split("://")[1].split(":")
-        with socket.create_connection((ip, int(port)), timeout=3):
+        r = requests.get("https://cems.cpcb.gov.in/public/", proxies={"http": proxy_url, "https": proxy_url}, timeout=8, verify=False)
+        if r.status_code == 200:
             return proxy_url
-    except Exception:
-        return None
+    except:
+        pass
+    return None
 
-def get_verified_proxies(max_needed=5):
-    candidates = fetch_socks_proxies()
-    print(f"Testing {len(candidates)} candidate proxies for open SOCKS ports...")
+def get_verified_proxies(max_needed=3):
+    candidates = fetch_indian_proxies()
+    print(f"Testing {len(candidates)} candidate proxies against CPCB firewall...")
     verified = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-        futures = {executor.submit(test_socket_handshake, p): p for p in candidates}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
+        futures = {executor.submit(test_proxy_handshake, p): p for p in candidates}
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
                 verified.append(res)
-                print(f"Verified live SOCKS Gateway: {res}")
+                print(f"Verified live Indian Gateway: {res}")
                 if len(verified) >= max_needed:
                     break
     return verified
 
-def abort_heavy_assets(route):
+def block_heavy_assets(route):
+    # Cuts data weight by 70%, crucial for slow free proxies
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
         route.abort()
     else:
         route.continue_()
 
 def run_inspection():
-    proxies = get_verified_proxies(max_needed=4)
+    proxies = get_verified_proxies(max_needed=3)
     if not proxies:
-        print("No responsive SOCKS proxies found; falling back to direct attempt.")
+        print("No responsive proxies found; falling back to direct attempt.")
         proxies = [None]
 
     for attempt, proxy in enumerate(proxies, 1):
@@ -99,11 +94,8 @@ def run_inspection():
 
         with sync_playwright() as p:
             launch_args = [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--ignore-certificate-errors",
-                "--window-size=1920,1080"
+                "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+                "--ignore-certificate-errors", "--disable-http2", "--window-size=1920,1080"
             ]
             launch_opts = {"headless": True, "args": launch_args}
             if proxy:
@@ -116,120 +108,82 @@ def run_inspection():
                 ignore_https_errors=True
             )
             page = context.new_page()
-            page.set_default_timeout(60000)
-            page.route("**/*", abort_heavy_assets)
+            
+            # MASSIVE 3-Minute Timeout to guarantee slow proxies can finish
+            page.set_default_timeout(180000)
+            page.route("**/*", block_heavy_assets)
+
+            # ---------------------------------------------------------
+            # 1. API NETWORK INTERCEPTOR (WIRETAP)
+            # ---------------------------------------------------------
+            captured_api_data = []
+            
+            def intercept_api_responses(response):
+                # Snatch JSON data packets in mid-air directly from the network tunnel
+                if response.request.resource_type in ["xhr", "fetch"]:
+                    try:
+                        resp_text = response.text()
+                        if "{" in resp_text and "}" in resp_text:
+                            captured_api_data.append(resp_text)
+                    except:
+                        pass
+                        
+            page.on("response", intercept_api_responses)
 
             try:
-                print("Navigating to CPCB dashboard over SOCKS tunnel...")
-                page.goto(DASHBOARD_URL, wait_until="commit", timeout=90000)
+                print("Navigating to Golden Link over secure tunnel...")
+                # commit = moves on as soon as initial ping connects
+                page.goto(DIRECT_URL, wait_until="commit", timeout=180000)
 
-                print("Waiting for grid rows to render...")
-                page.wait_for_selector("table, .ant-table, tr", timeout=60000)
-                page.wait_for_timeout(6000)
+                print("Waiting up to 90 seconds for API data packets to arrive...")
+                for _ in range(30): # 30 * 3 seconds = 90 seconds
+                    page.wait_for_timeout(3000)
+                    combined_json = "\n".join(captured_api_data).upper()
+                    
+                    # If we catch our industry data in the background API packets, we stop waiting!
+                    if "SIDDHI" in combined_json or "7257" in combined_json or "MG/M" in combined_json:
+                        print("SUCCESS! Intercepted raw JSON API payload from network background.")
+                        break
 
-                print("Locating search filter inputs...")
-                all_inputs = page.locator("input:not([readonly]):not([disabled])").all()
-                visible_inputs = [inp for inp in all_inputs if inp.is_visible()]
+                print("Ensuring Emission tab is triggered...")
+                try:
+                    # Force click the Emission tab to trigger any remaining API calls
+                    page.evaluate("""() => {
+                        const tabs = Array.from(document.querySelectorAll('button, a, div, span, [role="tab"]'));
+                        const emissionTab = tabs.find(el => el.textContent.trim().toUpperCase().includes('EMISSION'));
+                        if (emissionTab) { emissionTab.click(); }
+                    }""")
+                    page.wait_for_timeout(5000)
+                except:
+                    pass
 
-                if not visible_inputs:
-                    raise Exception("No active search inputs rendered on dashboard.")
-
-                row_isolated = False
-                for idx, field in enumerate(visible_inputs, 1):
-                    print(f"Testing filter input #{idx}...")
-                    try:
-                        field.click(timeout=5000)
-                        field.fill("")
-                        field.type(TARGET_INDUSTRY, delay=40)
-                        page.keyboard.press("Enter")
-                        page.wait_for_timeout(4000)
-
-                        match_count = page.locator("tr, .ant-table-row", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).count()
-                        if match_count > 0:
-                            print(f"Row successfully matched using filter input #{idx}!")
-                            row_isolated = True
-                            break
-                        else:
-                            field.fill("")
-                            page.keyboard.press("Enter")
-                            page.wait_for_timeout(1000)
-                    except Exception as err:
-                        print(f"Field #{idx} skipped: {err}")
-
-                if not row_isolated:
-                    raise Exception("Failed to isolate industry row in table.")
-
-                matched_row = page.locator("tr, .ant-table-row", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).first
-                row_raw_text = matched_row.inner_text()
-
-                print("Triggering Action Eye Icon via invisible JavaScript DOM dispatcher...")
-                click_action_result = page.evaluate("""() => {
-                    const eye = document.querySelector('.anticon-eye, [nztype="eye"], [data-icon="eye"], svg.ant-icon-eye');
-                    if (eye) {
-                        (eye.closest('button, a') || eye).click();
-                        return 'Clicked via .anticon-eye';
-                    }
-                    const fixedRight = document.querySelector('.ant-table-fixed-right');
-                    if (fixedRight) {
-                        const btn = fixedRight.querySelector('tbody tr a, tbody tr button, tbody tr i, tbody tr svg');
-                        if (btn) {
-                            btn.click();
-                            return 'Clicked via .ant-table-fixed-right container';
-                        }
-                    }
-                    const rows = Array.from(document.querySelectorAll('tbody tr')).filter(r => 
-                        r.textContent.toUpperCase().includes('SIDDHI VINAYAK')
-                    );
-                    if (rows.length > 0) {
-                        const cell = rows[0].querySelector('td:last-child');
-                        if (cell) {
-                            (cell.querySelector('button, a, i, svg') || cell).click();
-                            return 'Clicked via last column cell';
-                        }
-                    }
-                    return null;
-                }""")
-
-                if not click_action_result:
-                    raise Exception("Action Eye icon could not be located or clicked.")
-                print(f"Action button status: {click_action_result}")
-                page.wait_for_timeout(5000)
-
-                print("Switching to Emission tab/button...")
-                emission_click_result = page.evaluate("""() => {
-                    const nodes = Array.from(document.querySelectorAll('button, [role="tab"], .ant-tabs-tab, a, span, div'));
-                    for (const el of nodes) {
-                        const txt = el.textContent.trim().toUpperCase();
-                        if (txt === 'EMISSION' && el.offsetWidth > 0) {
-                            el.click();
-                            return 'Clicked exact Emission tab';
-                        }
-                    }
-                    for (const el of nodes) {
-                        const txt = el.textContent.trim().toUpperCase();
-                        if (txt.includes('EMISSION') && (el.tagName === 'BUTTON' || el.getAttribute('role') === 'tab' || el.classList.contains('ant-tabs-tab'))) {
-                            el.click();
-                            return 'Clicked fuzzy Emission tab';
-                        }
-                    }
-                    return null;
-                }""")
-                print(f"Emission panel status: {emission_click_result}")
-                page.wait_for_timeout(4000)
-
+                # ---------------------------------------------------------
+                # 2. DATA EXTRACTION & ANALYSIS
+                # ---------------------------------------------------------
+                print("Extracting parameters...")
+                
+                # We combine the raw JSON we wiretapped + whatever managed to render on the screen
                 page_full_text = page.inner_text("body")
-                full_combined_text = f"{row_raw_text}\n{page_full_text}"
-
+                master_data_pool = f"{page_full_text}\n" + "\n".join(captured_api_data)
+                
+                upper_body = master_data_pool.upper()
                 alert_reasons = []
 
-                upper_body = full_combined_text.upper()
+                # Condition 1: Check for NA
                 is_na_detected = any(pattern in upper_body for pattern in [
-                    " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE", "NOT AVAILABLE"
+                    " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE", '"NA"'
                 ])
                 if is_na_detected:
                     alert_reasons.append("• Reading is reported as <b>NA</b>")
 
-                emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)?", page_full_text, re.IGNORECASE)
+                # Condition 2: Numeric reading < 5.0 mg/m3
+                # Matches format like '4.2 mg/m3' or JSON '"value":"4.2","unit":"mg/Nm3"'
+                emission_numbers = re.findall(r"[\"']?(\d+(?:\.\d+)?)[\"']?\s*[,:]?\s*[\"']?(?:mg/m|mg/nm|µg/m)[\"']?", master_data_pool, re.IGNORECASE)
+                
+                if not emission_numbers:
+                    # Fallback standard scrape if JSON format varies
+                    emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)", page_full_text, re.IGNORECASE)
+
                 if emission_numbers and not is_na_detected:
                     val = float(emission_numbers[0])
                     if val < THRESHOLD:
@@ -237,8 +191,9 @@ def run_inspection():
                     else:
                         print(f"Emission reading normal: {val} mg/m³ >= {THRESHOLD} mg/m³")
 
+                # Condition 3: "Last received:" timestamp delayed by >= 1 hour
                 now_ist = datetime.now(IST)
-                timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", full_combined_text)
+                timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", master_data_pool)
 
                 if timestamp_match:
                     raw_ts_str = timestamp_match.group(0).strip()
@@ -257,10 +212,13 @@ def run_inspection():
                             m = int((time_diff.total_seconds() % 3600) // 60)
                             alert_reasons.append(f"• Telemetry delayed by <b>{h}h {m}m</b> (Last received: {last_received_ist.strftime('%d %b %I:%M %p')})")
                     except Exception as parse_err:
-                        print(f"Timestamp parsing error for '{raw_ts_str}': {parse_err}")
+                        print(f"Timestamp parsing error: {parse_err}")
                 else:
-                    print("Timestamp string not detected in extracted text.")
+                    print("Timestamp string not detected in extracted data pool.")
 
+                # ---------------------------------------------------------
+                # 3. DISPATCH NOTIFICATION
+                # ---------------------------------------------------------
                 if alert_reasons:
                     reasons_text = "\n".join(alert_reasons)
                     alert_time_str = now_ist.strftime("%I:%M %p (%d %b %Y)")
@@ -269,7 +227,7 @@ def run_inspection():
                         f"🏭 <b>Industry:</b> {TARGET_INDUSTRY}\n\n"
                         f"<b>Triggers:</b>\n{reasons_text}\n\n"
                         f"🕒 <b>Alert Time:</b> {alert_time_str}\n"
-                        f"🔗 <a href='{DASHBOARD_URL}'>Open CPCB Dashboard</a>"
+                        f"🔗 <a href='{DIRECT_URL}'>Open CPCB Dashboard</a>"
                     )
                     send_telegram(telegram_msg)
                     print(f"ALERT TRIGGERED! Telegram notification sent.")
