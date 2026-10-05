@@ -87,7 +87,8 @@ def check_cpcb():
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
-            "--ignore-certificate-errors"
+            "--ignore-certificate-errors",
+            "--window-size=1920,1080"
         ]
         launch_kwargs = {"headless": True, "args": launch_args}
         if proxy:
@@ -96,52 +97,81 @@ def check_cpcb():
         browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            ignore_https_errors=True
+            ignore_https_errors=True,
+            viewport={"width": 1920, "height": 1080}
         )
         page = context.new_page()
+        page.set_default_timeout(30000)
 
         try:
             print("Navigating to CPCB dashboard...")
             page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(8000)
+            
+            # 1. Wait longer for proxy loading
+            print("Waiting for the table to load over the proxy (this can take up to 20 seconds)...")
+            try:
+                page.wait_for_selector("table, .ag-root-wrapper, .mat-table, [role='grid']", timeout=45000)
+                print("Table grid detected!")
+            except:
+                print("Warning: Table grid didn't explicitly load within 45 seconds, continuing anyway.")
 
-            search_box = page.locator("input[placeholder*='Search' i], input[type='search']").first
+            page.wait_for_timeout(10000)
+
+            # 2. Advanced Search Input Handling
+            search_box = page.locator("input[placeholder*='Search' i], input[type='search'], [aria-label*='search' i]").first
             if search_box.is_visible(timeout=5000):
-                search_box.fill(TARGET_INDUSTRY)
+                print(f"Typing '{TARGET_INDUSTRY}' into search box...")
+                search_box.click()
+                search_box.fill("") 
+                # Mimics human typing character-by-character to trigger Angular's filter
+                search_box.type(TARGET_INDUSTRY, delay=100)
                 page.keyboard.press("Enter")
-                page.wait_for_timeout(4000)
+                
+                print("Waiting 10 seconds for results to filter...")
+                page.wait_for_timeout(10000)
+            else:
+                print("No search box found, checking current screen.")
 
-            row = page.locator("tr", has_text=TARGET_INDUSTRY).first
+            # 3. Locate Row (flexible selector for standard tables or ag-grid/material tables)
+            row = page.locator("tr, .mat-row, .ag-row, [role='row']", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).first
             if row.count() == 0:
-                print("Row not found.")
+                print("Row not found. Dumping visible page text for debugging:")
+                # Prints out text of body so we can see what actually loaded
+                print("-" * 40)
+                print(page.inner_text("body")[:1000])
+                print("-" * 40)
                 return
 
+            print("Found the industry row!")
             row_text = row.inner_text()
+            
+            # 4. Click the eye button
+            print("Clicking eye icon...")
             eye_btn = row.locator("button:has(.fa-eye), a:has(.fa-eye), i.fa-eye, [title*='View' i], svg").first
-            eye_btn.click()
-            page.wait_for_timeout(4000)
+            eye_btn.click(timeout=10000)
+            page.wait_for_timeout(6000)
 
+            # 5. Click Emission Tab
+            print("Switching to Emission tab...")
             emission_tab = page.locator("button:has-text('Emission'), [role='tab']:has-text('Emission'), a:has-text('Emission')").first
             if emission_tab.is_visible(timeout=5000):
                 emission_tab.click()
                 page.wait_for_timeout(4000)
 
+            # 6. Read Text
             modal = page.locator(".modal-content, [role='dialog'], .drawer, .card").first
             modal_text = modal.inner_text() if modal.count() > 0 else page.inner_text("body")
             full_text = f"{row_text}\n{modal_text}"
             
             # --- Condition Evaluation ---
             upper_text = modal_text.upper()
-            is_na = any(term in upper_text for term in [" NA", "N/A", "N.A", "DATA NOT AVAILABLE", "NOT AVAILABLE"])
+            is_na = any(term in upper_text for term in [" NA\n", " NA ", "N/A", "N.A", "DATA NOT AVAILABLE", "NOT AVAILABLE", "\nNA\n"])
             numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)?", modal_text, re.IGNORECASE)
 
             alert_reasons = []
 
-            # Cond 1: NA
             if is_na:
                 alert_reasons.append("• Reading is reported as <b>NA</b>")
-            
-            # Cond 2: < 5 mg/m3
             elif numbers:
                 val = float(numbers[0])
                 if val < THRESHOLD:
@@ -149,12 +179,10 @@ def check_cpcb():
                 else:
                     print(f"Reading normal: {val} mg/m³")
 
-            # Cond 3: Last Received Delay >= 1 Hour
             time_match = re.search(r"Last received:\s*([0-9a-zA-Z\s/:-]+)", full_text, re.IGNORECASE)
             if time_match:
                 raw_time_str = time_match.group(1).strip()
                 try:
-                    # Translate CPCB time into Indian Standard Time and compare against Current IST
                     last_time_naive = parser.parse(raw_time_str, fuzzy=True, dayfirst=True)
                     last_time_ist = IST.localize(last_time_naive)
                     now_ist = datetime.now(IST)
@@ -171,7 +199,6 @@ def check_cpcb():
                 except Exception as e:
                     print(f"Could not parse timestamp '{raw_time_str}': {e}")
 
-            # Dispatch Alert
             if alert_reasons:
                 reasons_str = "\n".join(alert_reasons)
                 now_str = datetime.now(IST).strftime("%I:%M %p")
@@ -190,6 +217,11 @@ def check_cpcb():
 
         except Exception as e:
             print(f"Extraction error: {e}")
+            print("Dumping current page text to help troubleshoot:")
+            try:
+                print(page.inner_text("body")[:1000])
+            except:
+                pass
         finally:
             browser.close()
 
