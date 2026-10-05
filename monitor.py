@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import concurrent.futures
 from datetime import datetime
 import requests
@@ -11,6 +10,7 @@ import urllib3
 
 urllib3.disable_warnings()
 
+BASE_URL = "https://cems.cpcb.gov.in/public/"
 DIRECT_URL = "https://cems.cpcb.gov.in/public/#/l/dashboard/site-info/eyJvYmoiOiJpbmR1c3RyeV83MjU3In0="
 TARGET_INDUSTRY = "SIDDHI VINAYAK PROCESS"
 THRESHOLD = 5.0
@@ -52,18 +52,18 @@ def fetch_indian_proxies():
 
 def test_proxy_handshake(proxy_url):
     try:
-        r = requests.get("https://cems.cpcb.gov.in/public/", proxies={"http": proxy_url, "https": proxy_url}, timeout=8, verify=False)
+        r = requests.get(BASE_URL, proxies={"http": proxy_url, "https": proxy_url}, timeout=8, verify=False)
         if r.status_code == 200:
             return proxy_url
     except:
         pass
     return None
 
-def get_verified_proxies(max_needed=3):
+def get_verified_proxies(max_needed=4):
     candidates = fetch_indian_proxies()
     print(f"Testing {len(candidates)} candidate proxies against CPCB firewall...")
     verified = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
         futures = {executor.submit(test_proxy_handshake, p): p for p in candidates}
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
@@ -75,14 +75,13 @@ def get_verified_proxies(max_needed=3):
     return verified
 
 def block_heavy_assets(route):
-    # Cuts data weight by 70%, crucial for slow free proxies
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
         route.abort()
     else:
         route.continue_()
 
 def run_inspection():
-    proxies = get_verified_proxies(max_needed=3)
+    proxies = get_verified_proxies(max_needed=4)
     if not proxies:
         print("No responsive proxies found; falling back to direct attempt.")
         proxies = [None]
@@ -93,61 +92,41 @@ def run_inspection():
         print(f"==================================================")
 
         with sync_playwright() as p:
-            launch_args = [
-                "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-                "--ignore-certificate-errors", "--disable-http2", "--window-size=1920,1080"
-            ]
-            launch_opts = {"headless": True, "args": launch_args}
+            # SWITCH TO FIREFOX ENGINE - Solves the Chromium proxy crash bug!
+            launch_opts = {"headless": True}
             if proxy:
                 launch_opts["proxy"] = {"server": proxy}
 
-            browser = p.chromium.launch(**launch_opts)
+            # Launching Firefox
+            browser = p.firefox.launch(**launch_opts)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
                 viewport={"width": 1920, "height": 1080},
                 ignore_https_errors=True
             )
             page = context.new_page()
             
-            # MASSIVE 3-Minute Timeout to guarantee slow proxies can finish
-            page.set_default_timeout(180000)
+            # Massive timeout for slow free proxies
+            page.set_default_timeout(120000)
             page.route("**/*", block_heavy_assets)
 
-            # ---------------------------------------------------------
-            # 1. API NETWORK INTERCEPTOR (WIRETAP)
-            # ---------------------------------------------------------
-            captured_api_data = []
-            
-            def intercept_api_responses(response):
-                # Snatch JSON data packets in mid-air directly from the network tunnel
-                if response.request.resource_type in ["xhr", "fetch"]:
-                    try:
-                        resp_text = response.text()
-                        if "{" in resp_text and "}" in resp_text:
-                            captured_api_data.append(resp_text)
-                    except:
-                        pass
-                        
-            page.on("response", intercept_api_responses)
-
             try:
-                print("Navigating to Golden Link over secure tunnel...")
-                # commit = moves on as soon as initial ping connects
-                page.goto(DIRECT_URL, wait_until="commit", timeout=180000)
+                print("Step 1: Bootstrapping Angular App via Firefox...")
+                # We hit the base URL first so Angular loads its core framework properly
+                page.goto(BASE_URL, wait_until="commit", timeout=120000)
+                page.wait_for_timeout(5000)
 
-                print("Waiting up to 90 seconds for API data packets to arrive...")
-                for _ in range(30): # 30 * 3 seconds = 90 seconds
-                    page.wait_for_timeout(3000)
-                    combined_json = "\n".join(captured_api_data).upper()
-                    
-                    # If we catch our industry data in the background API packets, we stop waiting!
-                    if "SIDDHI" in combined_json or "7257" in combined_json or "MG/M" in combined_json:
-                        print("SUCCESS! Intercepted raw JSON API payload from network background.")
-                        break
+                print("Step 2: Navigating to Golden Link...")
+                # Now we jump directly to the specific dashboard URL
+                page.goto(DIRECT_URL, wait_until="domcontentloaded", timeout=120000)
+
+                print("Waiting for industry panel to render...")
+                page.wait_for_selector(".ant-card, .ant-tabs, [role='tablist'], table", timeout=60000)
+                page.wait_for_timeout(5000)
 
                 print("Ensuring Emission tab is triggered...")
                 try:
-                    # Force click the Emission tab to trigger any remaining API calls
+                    # Look for and click the Emission tab
                     page.evaluate("""() => {
                         const tabs = Array.from(document.querySelectorAll('button, a, div, span, [role="tab"]'));
                         const emissionTab = tabs.find(el => el.textContent.trim().toUpperCase().includes('EMISSION'));
@@ -157,32 +136,21 @@ def run_inspection():
                 except:
                     pass
 
-                # ---------------------------------------------------------
-                # 2. DATA EXTRACTION & ANALYSIS
-                # ---------------------------------------------------------
                 print("Extracting parameters...")
-                
-                # We combine the raw JSON we wiretapped + whatever managed to render on the screen
                 page_full_text = page.inner_text("body")
-                master_data_pool = f"{page_full_text}\n" + "\n".join(captured_api_data)
+                upper_body = page_full_text.upper()
                 
-                upper_body = master_data_pool.upper()
                 alert_reasons = []
 
                 # Condition 1: Check for NA
                 is_na_detected = any(pattern in upper_body for pattern in [
-                    " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE", '"NA"'
+                    " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE"
                 ])
                 if is_na_detected:
                     alert_reasons.append("• Reading is reported as <b>NA</b>")
 
                 # Condition 2: Numeric reading < 5.0 mg/m3
-                # Matches format like '4.2 mg/m3' or JSON '"value":"4.2","unit":"mg/Nm3"'
-                emission_numbers = re.findall(r"[\"']?(\d+(?:\.\d+)?)[\"']?\s*[,:]?\s*[\"']?(?:mg/m|mg/nm|µg/m)[\"']?", master_data_pool, re.IGNORECASE)
-                
-                if not emission_numbers:
-                    # Fallback standard scrape if JSON format varies
-                    emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)", page_full_text, re.IGNORECASE)
+                emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)", page_full_text, re.IGNORECASE)
 
                 if emission_numbers and not is_na_detected:
                     val = float(emission_numbers[0])
@@ -193,7 +161,7 @@ def run_inspection():
 
                 # Condition 3: "Last received:" timestamp delayed by >= 1 hour
                 now_ist = datetime.now(IST)
-                timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", master_data_pool)
+                timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", page_full_text)
 
                 if timestamp_match:
                     raw_ts_str = timestamp_match.group(0).strip()
@@ -214,11 +182,9 @@ def run_inspection():
                     except Exception as parse_err:
                         print(f"Timestamp parsing error: {parse_err}")
                 else:
-                    print("Timestamp string not detected in extracted data pool.")
+                    print("Timestamp string not detected in extracted text.")
 
-                # ---------------------------------------------------------
-                # 3. DISPATCH NOTIFICATION
-                # ---------------------------------------------------------
+                # Dispatch Notification
                 if alert_reasons:
                     reasons_text = "\n".join(alert_reasons)
                     alert_time_str = now_ist.strftime("%I:%M %p (%d %b %Y)")
