@@ -73,14 +73,12 @@ def get_verified_proxies(max_needed=8):
     return verified
 
 def block_heavy_assets(route):
-    # Block heavy files to ensure fragile proxies don't time out
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
         route.abort()
     else:
         route.continue_()
 
 def run_inspection():
-    # Attempt up to 8 proxies. If 1 fails or loads a blank page, it jumps to the next.
     proxies = get_verified_proxies(max_needed=8)
     if not proxies:
         proxies = [None]
@@ -116,7 +114,6 @@ def run_inspection():
 
             captured_api_data = []
             
-            # THE WIRETAP
             def intercept_api_responses(response):
                 if response.request.resource_type in ["xhr", "fetch"]:
                     try:
@@ -162,30 +159,31 @@ def run_inspection():
                 upper_body = master_data_pool.upper()
                 alert_reasons = []
 
-                # Fail-safe: If the page text is blank or missing our data, kill this proxy and move to next
+                # --- VARIABLES FOR THE ROUTINE REPORT ---
+                routine_val = "NA"
+                routine_time = "Unknown"
+
                 if "SIDDHI" not in upper_body and "MG/M" not in upper_body:
                     raise Exception("Proxy loaded a blank page or dropped connection. Moving to next proxy.")
 
-                # Condition 1: Check for NA
                 is_na_detected = any(pattern in upper_body for pattern in [
                     " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE", '"NA"'
                 ])
                 if is_na_detected:
                     alert_reasons.append("• Reading is reported as <b>NA</b>")
 
-                # Condition 2: Numeric reading < 5.0 mg/m3
                 emission_numbers = re.findall(r"[\"']?(\d+(?:\.\d+)?)[\"']?\s*[,:]?\s*[\"']?(?:mg/m|mg/nm|µg/m)[\"']?", master_data_pool, re.IGNORECASE)
                 if not emission_numbers:
                     emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)", page_full_text, re.IGNORECASE)
 
                 if emission_numbers and not is_na_detected:
                     val = float(emission_numbers[0])
+                    routine_val = f"{val} mg/m³"  # Capture reading for the routine update
                     if val < THRESHOLD:
                         alert_reasons.append(f"• Emission value (<b>{val} mg/m³</b>) is below {THRESHOLD} mg/m³")
                     else:
                         print(f"Emission reading normal: {val} mg/m³ >= {THRESHOLD} mg/m³")
 
-                # Condition 3: Safe Date Parsing (MAY 10TH BUG FIXED)
                 now_ist = datetime.now(IST)
                 timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", master_data_pool)
 
@@ -193,16 +191,17 @@ def run_inspection():
                     raw_ts_str = timestamp_match.group(0).strip()
                     try:
                         try:
-                            # Force YYYY-MM-DD parsing first
                             parsed_dt = datetime.strptime(raw_ts_str, "%Y-%m-%d %H:%M")
                         except ValueError:
                             try:
-                                # Fallback DD-MM-YYYY
                                 parsed_dt = datetime.strptime(raw_ts_str.replace('/', '-'), "%d-%m-%Y %H:%M")
                             except ValueError:
                                 parsed_dt = parser.parse(raw_ts_str)
 
                         last_received_ist = IST.localize(parsed_dt) if parsed_dt.tzinfo is None else parsed_dt.astimezone(IST)
+                        
+                        routine_time = last_received_ist.strftime('%d %b %Y, %I:%M %p') # Capture time for the routine update
+                        
                         time_diff = now_ist - last_received_ist
                         delay_hours = time_diff.total_seconds() / 3600.0
 
@@ -212,7 +211,7 @@ def run_inspection():
                         if delay_hours >= DELAY_THRESHOLD_HOURS:
                             h = int(time_diff.total_seconds() // 3600)
                             m = int((time_diff.total_seconds() % 3600) // 60)
-                            alert_reasons.append(f"• Telemetry delayed by <b>{h}h {m}m</b> (Last received: {last_received_ist.strftime('%d %b %Y, %I:%M %p')})")
+                            alert_reasons.append(f"• Telemetry delayed by <b>{h}h {m}m</b> (Last received: {routine_time})")
                     except Exception as parse_err:
                         print(f"Timestamp parsing error: {parse_err}")
                 else:
@@ -220,18 +219,35 @@ def run_inspection():
                     if not success:
                         raise Exception("Failed to extract data payload. Proxy likely dropped connection mid-stream.")
 
-                if alert_reasons:
-                    reasons_text = "\n".join(alert_reasons)
+                # ---------------------------------------------------------
+                # NEW ROUTINE TRIGGER LOGIC (11 AM, 3 PM, 9:30 PM)
+                # ---------------------------------------------------------
+                is_scheduled = (now_ist.hour == 11 and now_ist.minute < 30) or \
+                               (now_ist.hour == 15 and now_ist.minute < 30) or \
+                               (now_ist.hour == 21 and now_ist.minute >= 30)
+
+                if alert_reasons or is_scheduled:
                     alert_time_str = now_ist.strftime("%I:%M %p (%d %b %Y)")
+                    
+                    # Switch headers depending on if it's a routine update or an actual alert
+                    header = "⚠️ <b>CPCB Emission Alert</b>" if alert_reasons else "📊 <b>Scheduled Routine Update</b>"
+                    
+                    triggers_text = ""
+                    if alert_reasons:
+                        reasons_text = "\n".join(alert_reasons)
+                        triggers_text = f"<b>Triggers:</b>\n{reasons_text}\n\n"
+                        
                     telegram_msg = (
-                        f"⚠️ <b>CPCB Emission Alert</b>\n\n"
+                        f"{header}\n\n"
                         f"🏭 <b>Industry:</b> {TARGET_INDUSTRY}\n\n"
-                        f"<b>Triggers:</b>\n{reasons_text}\n\n"
-                        f"🕒 <b>Alert Time:</b> {alert_time_str}\n"
+                        f"<b>Current Reading:</b> {routine_val}\n"
+                        f"<b>Last Received:</b> {routine_time}\n\n"
+                        f"{triggers_text}"
+                        f"🕒 <b>Report Time:</b> {alert_time_str}\n"
                         f"🔗 <a href='{DIRECT_URL}'>Open CPCB Dashboard</a>"
                     )
                     send_telegram(telegram_msg)
-                    print(f"ALERT TRIGGERED! Telegram notification sent.")
+                    print(f"Telegram notification sent! (Alert: {bool(alert_reasons)}, Scheduled: {is_scheduled})")
                 else:
                     print("Status normal. All conditions within acceptable thresholds.")
 
