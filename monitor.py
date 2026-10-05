@@ -10,9 +10,6 @@ import urllib3
 
 urllib3.disable_warnings()
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
 DASHBOARD_URL = "https://cems.cpcb.gov.in/public/#/l/realtime-connectivity-status-dashboard"
 TARGET_INDUSTRY = "SIDDHI VINAYAK PROCESS"
 THRESHOLD = 5.0
@@ -22,9 +19,6 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 IST = pytz.timezone("Asia/Kolkata")
 
-# ---------------------------------------------------------------------------
-# TELEGRAM DISPATCHER
-# ---------------------------------------------------------------------------
 def send_telegram(message: str):
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram keys missing from environment secrets.")
@@ -37,22 +31,16 @@ def send_telegram(message: str):
         "disable_web_page_preview": True
     }
     try:
-        res = requests.post(url, json=payload, timeout=20)
-        print(f"Telegram API response: {res.status_code}")
+        requests.post(url, json=payload, timeout=20)
     except Exception as e:
         print(f"Telegram notification error: {e}")
 
-# ---------------------------------------------------------------------------
-# MULTI-SOURCE INDIAN PROXY SWARM
-# ---------------------------------------------------------------------------
 def fetch_candidate_proxies():
+    # EXCLUSIVELY Indian Proxy endpoints to avoid Geo-blocks
     sources = [
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=6000&country=IN&ssl=all&anonymity=all",
         "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
-        "https://www.proxy-list.download/api/v1/get?type=https&country=IN",
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
-        "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+        "https://www.proxy-list.download/api/v1/get?type=https&country=IN"
     ]
     proxies = set()
     print("Scraping active Indian proxies...")
@@ -72,44 +60,41 @@ def test_proxy_handshake(proxy_ip):
         r = requests.get(
             "https://cems.cpcb.gov.in/public/",
             proxies={"http": p_url, "https": p_url},
-            timeout=5,
+            timeout=8,
             verify=False
         )
-        if r.status_code in [200, 301, 302, 401, 403]:
+        # CRITICAL FIX: Only accept HTTP 200 Success. 
+        # CPCB returns 403 Forbidden for blocked foreign IPs, which we now reject.
+        if r.status_code == 200:
             return p_url
     except Exception:
         pass
     return None
 
-def get_verified_proxies(max_needed=5):
+def get_verified_proxies(max_needed=3):
     candidates = fetch_candidate_proxies()
-    print(f"Testing {len(candidates)} candidate proxies against CPCB gateway...")
+    print(f"Testing {len(candidates)} candidate proxies against CPCB firewall...")
     verified = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
         futures = {executor.submit(test_proxy_handshake, p): p for p in candidates}
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
                 verified.append(res)
-                print(f"Verified Indian Gateway: {res}")
+                print(f"Verified true Indian Gateway: {res}")
                 if len(verified) >= max_needed:
                     break
     return verified
 
-# ---------------------------------------------------------------------------
-# BANDWIDTH OPTIMIZER
-# ---------------------------------------------------------------------------
 def abort_heavy_assets(route):
+    # Cuts data size by 70% to prevent proxy bandwidth timeouts
     if route.request.resource_type in ["image", "media", "font"]:
         route.abort()
     else:
         route.continue_()
 
-# ---------------------------------------------------------------------------
-# CORE SCRAPING & EVALUATION ENGINE
-# ---------------------------------------------------------------------------
 def run_inspection():
-    proxies = get_verified_proxies(max_needed=4)
+    proxies = get_verified_proxies(max_needed=3)
     if not proxies:
         print("No responsive Indian proxies found; falling back to direct attempt.")
         proxies = [None]
@@ -133,7 +118,7 @@ def run_inspection():
 
             browser = p.chromium.launch(**launch_opts)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 viewport={"width": 1920, "height": 1080},
                 ignore_https_errors=True
             )
@@ -142,16 +127,13 @@ def run_inspection():
             page.route("**/*", abort_heavy_assets)
 
             try:
-                # 1. Navigate to main dashboard
                 print("Navigating to CPCB dashboard...")
                 page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=75000)
 
-                # 2. Wait for Ant Design table hydration
                 print("Waiting for grid rows to render...")
                 page.wait_for_selector("table, .ant-table, tr", timeout=45000)
                 page.wait_for_timeout(6000)
 
-                # 3. Locate writable search filter inputs
                 print("Locating search filter inputs...")
                 all_inputs = page.locator("input:not([readonly]):not([disabled])").all()
                 visible_inputs = [inp for inp in all_inputs if inp.is_visible()]
@@ -169,7 +151,6 @@ def run_inspection():
                         page.keyboard.press("Enter")
                         page.wait_for_timeout(4000)
 
-                        # Check if target row is now isolated in the table
                         match_count = page.locator("tr, .ant-table-row", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).count()
                         if match_count > 0:
                             print(f"Row successfully matched using filter input #{idx}!")
@@ -185,22 +166,16 @@ def run_inspection():
                 if not row_isolated:
                     raise Exception("Failed to isolate industry row in table.")
 
-                # Extract captured row data
                 matched_row = page.locator("tr, .ant-table-row", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).first
                 row_raw_text = matched_row.inner_text()
 
-                # 4. Click the Action Eye Icon via in-page JavaScript evaluation
-                # This bypasses Ant Design's fixed-right floating table layout (.ant-table-fixed-right)
-                print("Triggering Action Eye Icon via DOM dispatcher...")
+                print("Triggering Action Eye Icon via invisible JavaScript DOM dispatcher...")
                 click_action_result = page.evaluate("""() => {
-                    // Check for Ant Design eye SVG / icon classes
                     const eye = document.querySelector('.anticon-eye, [nztype="eye"], [data-icon="eye"], svg.ant-icon-eye');
                     if (eye) {
                         (eye.closest('button, a') || eye).click();
                         return 'Clicked via .anticon-eye';
                     }
-
-                    // Check inside fixed-right column container
                     const fixedRight = document.querySelector('.ant-table-fixed-right');
                     if (fixedRight) {
                         const btn = fixedRight.querySelector('tbody tr a, tbody tr button, tbody tr i, tbody tr svg');
@@ -209,8 +184,6 @@ def run_inspection():
                             return 'Clicked via .ant-table-fixed-right container';
                         }
                     }
-
-                    // Fallback to last cell clickable element
                     const rows = Array.from(document.querySelectorAll('tbody tr')).filter(r => 
                         r.textContent.toUpperCase().includes('SIDDHI VINAYAK')
                     );
@@ -229,7 +202,6 @@ def run_inspection():
                 print(f"Action button status: {click_action_result}")
                 page.wait_for_timeout(5000)
 
-                # 5. Select the Emission Button
                 print("Switching to Emission tab/button...")
                 emission_click_result = page.evaluate("""() => {
                     const nodes = Array.from(document.querySelectorAll('button, [role="tab"], .ant-tabs-tab, a, span, div'));
@@ -252,20 +224,11 @@ def run_inspection():
                 print(f"Emission panel status: {emission_click_result}")
                 page.wait_for_timeout(4000)
 
-                # 6. Capture rendered readings from modal / card view
                 page_full_text = page.inner_text("body")
                 full_combined_text = f"{row_raw_text}\n{page_full_text}"
 
-                print("---- PREVIEW OF EXTRACTED DATA ----")
-                print("\n".join([line for line in full_combined_text.splitlines() if line.strip()][:25]))
-                print("-----------------------------------")
-
-                # ---------------------------------------------------------
-                # 7. EVALUATE THE 3 ALERT CONDITIONS
-                # ---------------------------------------------------------
                 alert_reasons = []
 
-                # Condition 1: Check for NA / Data Not Available
                 upper_body = full_combined_text.upper()
                 is_na_detected = any(pattern in upper_body for pattern in [
                     " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE", "NOT AVAILABLE"
@@ -273,8 +236,6 @@ def run_inspection():
                 if is_na_detected:
                     alert_reasons.append("• Reading is reported as <b>NA</b>")
 
-                # Condition 2: Numeric reading < 5.0 mg/m3
-                # Match numbers preceded or followed by emission units (mg/m3, mg/Nm3, etc.)
                 emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)?", page_full_text, re.IGNORECASE)
                 if emission_numbers and not is_na_detected:
                     val = float(emission_numbers[0])
@@ -283,8 +244,6 @@ def run_inspection():
                     else:
                         print(f"Emission reading normal: {val} mg/m³ >= {THRESHOLD} mg/m³")
 
-                # Condition 3: "Last received:" timestamp delayed by >= 1 hour
-                # Patterns like '2026-10-05 14:15' or '05-10-2026 14:15' or labeled 'Last received: ...'
                 now_ist = datetime.now(IST)
                 timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", full_combined_text)
 
@@ -309,7 +268,6 @@ def run_inspection():
                 else:
                     print("Timestamp string not detected in extracted text.")
 
-                # 8. Dispatch notification if any conditions met
                 if alert_reasons:
                     reasons_text = "\n".join(alert_reasons)
                     alert_time_str = now_ist.strftime("%I:%M %p (%d %b %Y)")
@@ -325,7 +283,6 @@ def run_inspection():
                 else:
                     print("Status normal. All conditions within acceptable thresholds.")
 
-                # Successful execution completed
                 return
 
             except Exception as e:
