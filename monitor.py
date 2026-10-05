@@ -107,71 +107,87 @@ def check_cpcb():
             print("Navigating to CPCB dashboard...")
             page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=90000)
             
-            # 1. Wait longer for proxy loading
-            print("Waiting for the table to load over the proxy (this can take up to 20 seconds)...")
+            print("Waiting for the table to load over the proxy...")
             try:
                 page.wait_for_selector("table, .ag-root-wrapper, .mat-table, [role='grid']", timeout=45000)
-                print("Table grid detected!")
+                page.wait_for_timeout(8000) # Give extra time for data to populate
             except:
-                print("Warning: Table grid didn't explicitly load within 45 seconds, continuing anyway.")
+                print("Table grid didn't explicitly load, proceeding anyway...")
 
-            page.wait_for_timeout(10000)
+            # ---------------------------------------------------------
+            # 2. SELF-HEALING SEARCH ENGINE
+            # ---------------------------------------------------------
+            print("Locating all search inputs on the page...")
+            all_inputs = page.locator("input").all()
+            visible_inputs = [inp for inp in all_inputs if inp.is_visible()]
+            
+            print(f"Found {len(visible_inputs)} text boxes. Commencing guess-and-check filter...")
+            
+            row_found = False
+            for i, current_input in enumerate(visible_inputs):
+                print(f"  -> Typing into text box #{i+1}...")
+                try:
+                    current_input.click(timeout=3000)
+                    current_input.fill("")
+                    current_input.type(TARGET_INDUSTRY, delay=50)
+                    page.keyboard.press("Enter")
+                    
+                    # Wait for Angular to redraw the table
+                    page.wait_for_timeout(4000) 
+                    
+                    # Check if our target row appeared
+                    row = page.locator("tr, .mat-row, .ag-row, [role='row']", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).first
+                    if row.count() > 0:
+                        print(f"SUCCESS! Text box #{i+1} is the correct filter.")
+                        row_found = True
+                        break
+                    else:
+                        # Revert the box and move to the next one
+                        current_input.fill("")
+                        page.keyboard.press("Enter")
+                        page.wait_for_timeout(1000)
+                except Exception as e:
+                    print(f"  -> Skipped box #{i+1}: {e}")
 
-            # 2. Advanced Search Input Handling
-            search_box = page.locator("input[placeholder*='Search' i], input[type='search'], [aria-label*='search' i]").first
-            if search_box.is_visible(timeout=5000):
-                print(f"Typing '{TARGET_INDUSTRY}' into search box...")
-                search_box.click()
-                search_box.fill("") 
-                # Mimics human typing character-by-character to trigger Angular's filter
-                search_box.type(TARGET_INDUSTRY, delay=100)
-                page.keyboard.press("Enter")
-                
-                print("Waiting 10 seconds for results to filter...")
-                page.wait_for_timeout(10000)
-            else:
-                print("No search box found, checking current screen.")
-
-            # 3. Locate Row (flexible selector for standard tables or ag-grid/material tables)
-            row = page.locator("tr, .mat-row, .ag-row, [role='row']", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).first
-            if row.count() == 0:
-                print("Row not found. Dumping visible page text for debugging:")
-                # Prints out text of body so we can see what actually loaded
+            if not row_found:
+                print("FAILED to find row after testing every text box.")
+                print("Dumping visible page text for debugging:")
                 print("-" * 40)
                 print(page.inner_text("body")[:1000])
                 print("-" * 40)
                 return
+            # ---------------------------------------------------------
 
-            print("Found the industry row!")
             row_text = row.inner_text()
             
-            # 4. Click the eye button
             print("Clicking eye icon...")
             eye_btn = row.locator("button:has(.fa-eye), a:has(.fa-eye), i.fa-eye, [title*='View' i], svg").first
             eye_btn.click(timeout=10000)
             page.wait_for_timeout(6000)
 
-            # 5. Click Emission Tab
             print("Switching to Emission tab...")
             emission_tab = page.locator("button:has-text('Emission'), [role='tab']:has-text('Emission'), a:has-text('Emission')").first
             if emission_tab.is_visible(timeout=5000):
                 emission_tab.click()
                 page.wait_for_timeout(4000)
 
-            # 6. Read Text
+            # Read Modal Text
             modal = page.locator(".modal-content, [role='dialog'], .drawer, .card").first
             modal_text = modal.inner_text() if modal.count() > 0 else page.inner_text("body")
             full_text = f"{row_text}\n{modal_text}"
             
-            # --- Condition Evaluation ---
+            # --- Evaluate Your 3 Conditions ---
             upper_text = modal_text.upper()
             is_na = any(term in upper_text for term in [" NA\n", " NA ", "N/A", "N.A", "DATA NOT AVAILABLE", "NOT AVAILABLE", "\nNA\n"])
             numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)?", modal_text, re.IGNORECASE)
 
             alert_reasons = []
 
+            # Cond 1: NA
             if is_na:
                 alert_reasons.append("• Reading is reported as <b>NA</b>")
+            
+            # Cond 2: < 5 mg/m3
             elif numbers:
                 val = float(numbers[0])
                 if val < THRESHOLD:
@@ -179,6 +195,7 @@ def check_cpcb():
                 else:
                     print(f"Reading normal: {val} mg/m³")
 
+            # Cond 3: Delay > 1 Hour
             time_match = re.search(r"Last received:\s*([0-9a-zA-Z\s/:-]+)", full_text, re.IGNORECASE)
             if time_match:
                 raw_time_str = time_match.group(1).strip()
@@ -199,6 +216,7 @@ def check_cpcb():
                 except Exception as e:
                     print(f"Could not parse timestamp '{raw_time_str}': {e}")
 
+            # Dispatch Telegram Message
             if alert_reasons:
                 reasons_str = "\n".join(alert_reasons)
                 now_str = datetime.now(IST).strftime("%I:%M %p")
@@ -217,11 +235,6 @@ def check_cpcb():
 
         except Exception as e:
             print(f"Extraction error: {e}")
-            print("Dumping current page text to help troubleshoot:")
-            try:
-                print(page.inner_text("body")[:1000])
-            except:
-                pass
         finally:
             browser.close()
 
