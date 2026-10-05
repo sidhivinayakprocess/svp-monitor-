@@ -10,7 +10,6 @@ import urllib3
 
 urllib3.disable_warnings()
 
-BASE_URL = "https://cems.cpcb.gov.in/public/"
 DIRECT_URL = "https://cems.cpcb.gov.in/public/#/l/dashboard/site-info/eyJvYmoiOiJpbmR1c3RyeV83MjU3In0="
 TARGET_INDUSTRY = "SIDDHI VINAYAK PROCESS"
 THRESHOLD = 5.0
@@ -35,8 +34,7 @@ def fetch_indian_proxies():
     sources = [
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=IN&ssl=all&anonymity=all",
         "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
-        "https://www.proxy-list.download/api/v1/get?type=https&country=IN",
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
+        "https://www.proxy-list.download/api/v1/get?type=https&country=IN"
     ]
     proxies = set()
     print("Scraping active Indian HTTP proxies...")
@@ -52,7 +50,7 @@ def fetch_indian_proxies():
 
 def test_proxy_handshake(proxy_url):
     try:
-        r = requests.get(BASE_URL, proxies={"http": proxy_url, "https": proxy_url}, timeout=8, verify=False)
+        r = requests.get("https://cems.cpcb.gov.in/public/", proxies={"http": proxy_url, "https": proxy_url}, timeout=8, verify=False)
         if r.status_code == 200:
             return proxy_url
     except:
@@ -75,6 +73,7 @@ def get_verified_proxies(max_needed=4):
     return verified
 
 def block_heavy_assets(route):
+    # Cuts data weight by 70%, crucial for slow free proxies
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
         route.abort()
     else:
@@ -92,41 +91,57 @@ def run_inspection():
         print(f"==================================================")
 
         with sync_playwright() as p:
-            # SWITCH TO FIREFOX ENGINE - Solves the Chromium proxy crash bug!
-            launch_opts = {"headless": True}
+            launch_args = [
+                "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+                "--ignore-certificate-errors", "--disable-http2", "--window-size=1920,1080"
+            ]
+            launch_opts = {"headless": True, "args": launch_args}
             if proxy:
                 launch_opts["proxy"] = {"server": proxy}
 
-            # Launching Firefox
-            browser = p.firefox.launch(**launch_opts)
+            browser = p.chromium.launch(**launch_opts)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 viewport={"width": 1920, "height": 1080},
                 ignore_https_errors=True
             )
             page = context.new_page()
             
-            # Massive timeout for slow free proxies
-            page.set_default_timeout(120000)
+            # MASSIVE 3-Minute Timeout to guarantee slow proxies can finish
+            page.set_default_timeout(180000)
             page.route("**/*", block_heavy_assets)
 
+            # ---------------------------------------------------------
+            # 1. THE WINNING API NETWORK INTERCEPTOR (WIRETAP)
+            # ---------------------------------------------------------
+            captured_api_data = []
+            
+            def intercept_api_responses(response):
+                if response.request.resource_type in ["xhr", "fetch"]:
+                    try:
+                        resp_text = response.text()
+                        if "{" in resp_text and "}" in resp_text:
+                            captured_api_data.append(resp_text)
+                    except:
+                        pass
+                        
+            page.on("response", intercept_api_responses)
+
             try:
-                print("Step 1: Bootstrapping Angular App via Firefox...")
-                # We hit the base URL first so Angular loads its core framework properly
-                page.goto(BASE_URL, wait_until="commit", timeout=120000)
-                page.wait_for_timeout(5000)
+                print("Navigating to Golden Link over secure tunnel...")
+                page.goto(DIRECT_URL, wait_until="commit", timeout=180000)
 
-                print("Step 2: Navigating to Golden Link...")
-                # Now we jump directly to the specific dashboard URL
-                page.goto(DIRECT_URL, wait_until="domcontentloaded", timeout=120000)
-
-                print("Waiting for industry panel to render...")
-                page.wait_for_selector(".ant-card, .ant-tabs, [role='tablist'], table", timeout=60000)
-                page.wait_for_timeout(5000)
+                print("Waiting up to 90 seconds for API data packets to arrive...")
+                for _ in range(30):
+                    page.wait_for_timeout(3000)
+                    combined_json = "\n".join(captured_api_data).upper()
+                    
+                    if "SIDDHI" in combined_json or "7257" in combined_json or "MG/M" in combined_json:
+                        print("SUCCESS! Intercepted raw JSON API payload from network background.")
+                        break
 
                 print("Ensuring Emission tab is triggered...")
                 try:
-                    # Look for and click the Emission tab
                     page.evaluate("""() => {
                         const tabs = Array.from(document.querySelectorAll('button, a, div, span, [role="tab"]'));
                         const emissionTab = tabs.find(el => el.textContent.trim().toUpperCase().includes('EMISSION'));
@@ -136,21 +151,29 @@ def run_inspection():
                 except:
                     pass
 
+                # ---------------------------------------------------------
+                # 2. DATA EXTRACTION & ANALYSIS
+                # ---------------------------------------------------------
                 print("Extracting parameters...")
-                page_full_text = page.inner_text("body")
-                upper_body = page_full_text.upper()
                 
+                page_full_text = page.inner_text("body")
+                master_data_pool = f"{page_full_text}\n" + "\n".join(captured_api_data)
+                
+                upper_body = master_data_pool.upper()
                 alert_reasons = []
 
                 # Condition 1: Check for NA
                 is_na_detected = any(pattern in upper_body for pattern in [
-                    " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE"
+                    " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE", '"NA"'
                 ])
                 if is_na_detected:
                     alert_reasons.append("• Reading is reported as <b>NA</b>")
 
                 # Condition 2: Numeric reading < 5.0 mg/m3
-                emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)", page_full_text, re.IGNORECASE)
+                emission_numbers = re.findall(r"[\"']?(\d+(?:\.\d+)?)[\"']?\s*[,:]?\s*[\"']?(?:mg/m|mg/nm|µg/m)[\"']?", master_data_pool, re.IGNORECASE)
+                
+                if not emission_numbers:
+                    emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)", page_full_text, re.IGNORECASE)
 
                 if emission_numbers and not is_na_detected:
                     val = float(emission_numbers[0])
@@ -159,16 +182,27 @@ def run_inspection():
                     else:
                         print(f"Emission reading normal: {val} mg/m³ >= {THRESHOLD} mg/m³")
 
-                # Condition 3: "Last received:" timestamp delayed by >= 1 hour
+                # ---------------------------------------------------------
+                # Condition 3: "Last received:" timestamp (MAY 10TH BUG FIXED)
+                # ---------------------------------------------------------
                 now_ist = datetime.now(IST)
-                timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", page_full_text)
+                timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", master_data_pool)
 
                 if timestamp_match:
                     raw_ts_str = timestamp_match.group(0).strip()
                     try:
-                        parsed_dt = parser.parse(raw_ts_str, fuzzy=True, dayfirst=True)
-                        last_received_ist = IST.localize(parsed_dt) if parsed_dt.tzinfo is None else parsed_dt.astimezone(IST)
+                        # Try strict YYYY-MM-DD parsing first to avoid Day/Month swaps
+                        try:
+                            parsed_dt = datetime.strptime(raw_ts_str, "%Y-%m-%d %H:%M")
+                        except ValueError:
+                            # Try DD-MM-YYYY fallback
+                            try:
+                                parsed_dt = datetime.strptime(raw_ts_str.replace('/', '-'), "%d-%m-%Y %H:%M")
+                            except ValueError:
+                                # Safe library fallback
+                                parsed_dt = parser.parse(raw_ts_str)
 
+                        last_received_ist = IST.localize(parsed_dt) if parsed_dt.tzinfo is None else parsed_dt.astimezone(IST)
                         time_diff = now_ist - last_received_ist
                         delay_hours = time_diff.total_seconds() / 3600.0
 
@@ -178,13 +212,15 @@ def run_inspection():
                         if delay_hours >= DELAY_THRESHOLD_HOURS:
                             h = int(time_diff.total_seconds() // 3600)
                             m = int((time_diff.total_seconds() % 3600) // 60)
-                            alert_reasons.append(f"• Telemetry delayed by <b>{h}h {m}m</b> (Last received: {last_received_ist.strftime('%d %b %I:%M %p')})")
+                            alert_reasons.append(f"• Telemetry delayed by <b>{h}h {m}m</b> (Last received: {last_received_ist.strftime('%d %b %Y, %I:%M %p')})")
                     except Exception as parse_err:
                         print(f"Timestamp parsing error: {parse_err}")
                 else:
-                    print("Timestamp string not detected in extracted text.")
+                    print("Timestamp string not detected in extracted data pool.")
 
-                # Dispatch Notification
+                # ---------------------------------------------------------
+                # 3. DISPATCH NOTIFICATION
+                # ---------------------------------------------------------
                 if alert_reasons:
                     reasons_text = "\n".join(alert_reasons)
                     alert_time_str = now_ist.strftime("%I:%M %p (%d %b %Y)")
