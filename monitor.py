@@ -1,5 +1,6 @@
 import os
 import re
+import socket
 import concurrent.futures
 from datetime import datetime
 import requests
@@ -35,52 +36,46 @@ def send_telegram(message: str):
     except Exception as e:
         print(f"Telegram notification error: {e}")
 
-def fetch_candidate_proxies():
-    # EXCLUSIVELY Indian Proxy endpoints to avoid Geo-blocks
+def fetch_socks_proxies():
+    # EXCLUSIVELY scraping SOCKS4/5 proxies to bypass HTTP parsing disconnects
     sources = [
-        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=6000&country=IN&ssl=all&anonymity=all",
-        "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
-        "https://www.proxy-list.download/api/v1/get?type=https&country=IN"
+        ("socks5", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=IN"),
+        ("socks4", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=IN"),
+        ("socks5", "https://www.proxy-list.download/api/v1/get?type=socks5&country=IN"),
+        ("socks4", "https://www.proxy-list.download/api/v1/get?type=socks4&country=IN")
     ]
     proxies = set()
-    print("Scraping active Indian proxies...")
-    for src in sources:
+    print("Scraping active Indian SOCKS5/SOCKS4 proxies...")
+    for proto, src in sources:
         try:
             r = requests.get(src, timeout=8)
             if r.status_code == 200:
                 for match in re.finditer(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", r.text):
-                    proxies.add(match.group(0))
+                    proxies.add(f"{proto}://{match.group(0)}")
         except Exception:
             continue
     return list(proxies)
 
-def test_proxy_handshake(proxy_ip):
-    p_url = f"http://{proxy_ip}"
+def test_socket_handshake(proxy_url):
+    # Tests if the SOCKS proxy port is alive and open for routing
     try:
-        r = requests.get(
-            "https://cems.cpcb.gov.in/public/",
-            proxies={"http": p_url, "https": p_url},
-            timeout=8,
-            verify=False
-        )
-        # CRITICAL FIX: Only accept HTTP 200 Success. 
-        if r.status_code == 200:
-            return p_url
+        ip, port = proxy_url.split("://")[1].split(":")
+        with socket.create_connection((ip, int(port)), timeout=3):
+            return proxy_url
     except Exception:
-        pass
-    return None
+        return None
 
-def get_verified_proxies(max_needed=3):
-    candidates = fetch_candidate_proxies()
-    print(f"Testing {len(candidates)} candidate proxies against CPCB firewall...")
+def get_verified_proxies(max_needed=5):
+    candidates = fetch_socks_proxies()
+    print(f"Testing {len(candidates)} candidate proxies for open SOCKS ports...")
     verified = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-        futures = {executor.submit(test_proxy_handshake, p): p for p in candidates}
+        futures = {executor.submit(test_socket_handshake, p): p for p in candidates}
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
                 verified.append(res)
-                print(f"Verified true Indian Gateway: {res}")
+                print(f"Verified live SOCKS Gateway: {res}")
                 if len(verified) >= max_needed:
                     break
     return verified
@@ -92,9 +87,9 @@ def abort_heavy_assets(route):
         route.continue_()
 
 def run_inspection():
-    proxies = get_verified_proxies(max_needed=3)
+    proxies = get_verified_proxies(max_needed=4)
     if not proxies:
-        print("No responsive Indian proxies found; falling back to direct attempt.")
+        print("No responsive SOCKS proxies found; falling back to direct attempt.")
         proxies = [None]
 
     for attempt, proxy in enumerate(proxies, 1):
@@ -103,14 +98,11 @@ def run_inspection():
         print(f"==================================================")
 
         with sync_playwright() as p:
-            # Engine-level HTTP/1.1 downgrade and rendering block
             launch_args = [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--ignore-certificate-errors",
-                "--disable-http2",  # CRITICAL: Forces cheap proxies to not drop connections
-                "--blink-settings=imagesEnabled=false", # Hard-disable images
                 "--window-size=1920,1080"
             ]
             launch_opts = {"headless": True, "args": launch_args}
@@ -128,11 +120,10 @@ def run_inspection():
             page.route("**/*", abort_heavy_assets)
 
             try:
-                print("Navigating to CPCB dashboard...")
-                # wait_until='commit' stops ERR_TIMED_OUT on the initial HTML request
-                page.goto(DASHBOARD_URL, wait_until="commit", timeout=120000)
+                print("Navigating to CPCB dashboard over SOCKS tunnel...")
+                page.goto(DASHBOARD_URL, wait_until="commit", timeout=90000)
 
-                print("Waiting for grid rows to render (Max 60 seconds)...")
+                print("Waiting for grid rows to render...")
                 page.wait_for_selector("table, .ant-table, tr", timeout=60000)
                 page.wait_for_timeout(6000)
 
