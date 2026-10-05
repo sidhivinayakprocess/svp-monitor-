@@ -9,7 +9,8 @@ from playwright.sync_api import sync_playwright
 import urllib3
 urllib3.disable_warnings()
 
-DASHBOARD_URL = "https://cems.cpcb.gov.in/public/#/l/realtime-connectivity-status-dashboard"
+# The Golden URL you found! Jumps directly to Siddhi Vinayak Process
+DIRECT_URL = "https://cems.cpcb.gov.in/public/#/l/dashboard/site-info/eyJvYmoiOiJpbmR1c3RyeV83MjU3In0="
 TARGET_INDUSTRY = "SIDDHI VINAYAK PROCESS"
 THRESHOLD = 5.0
 
@@ -60,7 +61,7 @@ def test_proxy(proxy):
         pass
     return None
 
-def get_working_proxies(limit=3):
+def get_working_proxies(limit=4):
     proxies = fetch_indian_proxies()
     print(f"Testing {len(proxies)} proxies concurrently...")
     
@@ -76,8 +77,15 @@ def get_working_proxies(limit=3):
                     break
     return working_proxies
 
+def block_heavy_resources(route):
+    # Block images/fonts so the proxy loads lightning fast
+    if route.request.resource_type in ["image", "media", "font"]:
+        route.abort()
+    else:
+        route.continue_()
+
 def check_cpcb():
-    proxy_list = get_working_proxies(limit=3)
+    proxy_list = get_working_proxies(limit=4)
     if not proxy_list:
         print("No proxies found, attempting direct fallback...")
         proxy_list = [None]
@@ -104,82 +112,16 @@ def check_cpcb():
                 viewport={"width": 1920, "height": 1080}
             )
             page = context.new_page()
+            page.route("**/*", block_heavy_resources)
 
             try:
-                print("Navigating to CPCB dashboard...")
-                page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=90000)
+                print("Navigating DIRECTLY to Siddhi Vinayak Process portal...")
+                # Jump straight to the dashboard using your exact link
+                page.goto(DIRECT_URL, wait_until="domcontentloaded", timeout=60000)
                 
-                print("Waiting for the table to load over the proxy...")
-                page.wait_for_selector("table, .ag-root-wrapper, .mat-table, .ant-table", timeout=45000)
-                print("Table grid detected! Letting data hydrate...")
-                page.wait_for_timeout(8000)
-
-                # ---------------------------------------------------------
-                # SEARCH ENGINE
-                # ---------------------------------------------------------
-                print("Locating all valid search inputs on the page...")
-                all_inputs = page.locator("input").all()
-                visible_inputs = [inp for inp in all_inputs if inp.is_visible() and not inp.get_attribute("readonly") and not inp.get_attribute("disabled")]
-                
-                if not visible_inputs:
-                    raise Exception("Page loaded but no writable search boxes appeared.")
-
-                print(f"Found {len(visible_inputs)} writable text boxes. Commencing search...")
-                
-                row_found = False
-                for i, current_input in enumerate(visible_inputs):
-                    print(f"  -> Typing into text box #{i+1}...")
-                    try:
-                        current_input.click(timeout=3000)
-                        current_input.fill("")
-                        current_input.type(TARGET_INDUSTRY, delay=50)
-                        page.keyboard.press("Enter")
-                        
-                        page.wait_for_timeout(4000) 
-                        
-                        # Verify the row exists anywhere in the main table area
-                        row = page.locator("tr, .mat-row, .ag-row, [role='row']", has_text=re.compile(TARGET_INDUSTRY, re.IGNORECASE)).first
-                        if row.count() > 0:
-                            print(f"SUCCESS! Text box #{i+1} is the correct filter.")
-                            row_found = True
-                            break
-                        else:
-                            current_input.fill("")
-                            page.keyboard.press("Enter")
-                            page.wait_for_timeout(1000)
-                    except Exception as e:
-                        print(f"  -> Skipped box #{i+1}: {e}")
-
-                if not row_found:
-                    raise Exception("Target row not found. Filter failed.")
-
-                row_text = row.inner_text()
-                
-                # ---------------------------------------------------------
-                # ACTION BUTTON CLICKER (BYPASSES ANT-DESIGN SPLIT TABLE)
-                # ---------------------------------------------------------
-                print("Clicking action icon...")
-                
-                # We filter the table to 1 row, so we just blindly click the first valid view icon anywhere in the table area
-                eye_btn = page.locator(".anticon-eye, .fa-eye, [data-icon='eye'], img[src*='eye'], [title*='View' i]").first
-                
-                if eye_btn.is_visible(timeout=5000):
-                    print("Found standard Eye icon! Clicking it...")
-                    eye_btn.click(force=True)
-                else:
-                    print("No standard eye icon. Using JS to click the action button in the fixed-right column...")
-                    clicked = page.evaluate('''() => {
-                        let buttons = Array.from(document.querySelectorAll('tbody button, tbody a, .ant-table-fixed-right button, .ant-table-fixed-right a'));
-                        let visible = buttons.filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
-                        if (visible.length > 0) {
-                            visible[0].click();
-                            return true;
-                        }
-                        return false;
-                    }''')
-                    if not clicked:
-                        raise Exception("Could not find any clickable elements in the table body.")
-
+                print("Waiting for industry panel to hydrate...")
+                # Wait for any generic card, tab, or grid layout to appear
+                page.wait_for_selector(".ant-card, .ant-tabs, [role='tablist']", timeout=30000)
                 page.wait_for_timeout(5000)
 
                 print("Switching to Emission tab...")
@@ -187,21 +129,25 @@ def check_cpcb():
                 if emission_tab.is_visible(timeout=5000):
                     emission_tab.click()
                     page.wait_for_timeout(4000)
+                else:
+                    print("Emission tab not explicitly found. It might already be open. Scanning page...")
 
-                # Read Modal Text
-                modal = page.locator(".modal-content, [role='dialog'], .drawer, .card, .ant-modal-content, .ant-drawer-content").first
-                modal_text = modal.inner_text() if modal.count() > 0 else page.inner_text("body")
-                full_text = f"{row_text}\n{modal_text}"
+                # Read all text currently visible on the page
+                full_text = page.inner_text("body")
                 
                 # --- Evaluate Your 3 Conditions ---
-                upper_text = modal_text.upper()
+                upper_text = full_text.upper()
                 is_na = any(term in upper_text for term in [" NA\n", " NA ", "N/A", "N.A", "DATA NOT AVAILABLE", "NOT AVAILABLE", "\nNA\n"])
-                numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)?", modal_text, re.IGNORECASE)
+                
+                # Find all numbers attached to mg/m3 or similar units
+                numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)?", full_text, re.IGNORECASE)
 
                 alert_reasons = []
 
+                # Condition 1: NA
                 if is_na:
                     alert_reasons.append("• Reading is reported as <b>NA</b>")
+                # Condition 2: < 5 mg/m3
                 elif numbers:
                     val = float(numbers[0])
                     if val < THRESHOLD:
@@ -209,7 +155,7 @@ def check_cpcb():
                     else:
                         print(f"Reading normal: {val} mg/m³")
 
-                # Parse the "Last Data Received" timestamp directly (Format: YYYY-MM-DD HH:MM)
+                # Condition 3: Delay > 1 Hour (Format: YYYY-MM-DD HH:MM)
                 time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})", full_text)
                 if time_match:
                     raw_time_str = time_match.group(1).strip()
@@ -230,7 +176,7 @@ def check_cpcb():
                     except Exception as e:
                         print(f"Could not parse timestamp '{raw_time_str}': {e}")
                 else:
-                    print("Warning: Could not locate a valid timestamp in the row or modal.")
+                    print("Warning: Could not locate a valid YYYY-MM-DD timestamp on the page.")
 
                 if alert_reasons:
                     reasons_str = "\n".join(alert_reasons)
@@ -240,12 +186,12 @@ def check_cpcb():
                         f"🏭 <b>Industry:</b> {TARGET_INDUSTRY}\n\n"
                         f"<b>Triggers:</b>\n{reasons_str}\n\n"
                         f"🕒 <b>Alert Time:</b> {now_str}\n"
-                        f"🔗 <a href='{DASHBOARD_URL}'>Open CPCB Portal</a>"
+                        f"🔗 <a href='{DIRECT_URL}'>Open Direct Portal</a>"
                     )
                     send_telegram(msg)
                     print("Alert sent successfully.")
                 else:
-                    print("No alert required.")
+                    print("No alert required. Readings are normal.")
 
                 # If we reach this line, the scrape was 100% successful! 
                 return 
@@ -255,7 +201,7 @@ def check_cpcb():
             finally:
                 browser.close()
                 
-    print("\nCRITICAL: All 3 proxies failed to load the data. Will try again on the next 30-minute schedule.")
+    print("\nCRITICAL: All proxies failed to load the data. Will try again on the next 30-minute schedule.")
 
 if __name__ == "__main__":
     check_cpcb()
