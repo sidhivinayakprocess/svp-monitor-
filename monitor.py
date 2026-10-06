@@ -19,19 +19,28 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 IST = pytz.timezone("Asia/Kolkata")
 
-def send_telegram(message: str):
+def send_telegram(message: str, image_path: str = None):
+    """Sends a Telegram message, with an optional photo attachment."""
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram keys missing.")
         return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+    
     try:
-        requests.post(url, json=payload, timeout=20)
+        if image_path and os.path.exists(image_path):
+            # Send Photo with Caption
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+            with open(image_path, "rb") as photo:
+                payload = {"chat_id": CHAT_ID, "caption": message[:1024], "parse_mode": "HTML"}
+                requests.post(url, data=payload, files={"photo": photo}, timeout=30)
+        else:
+            # Send Text Only
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+            requests.post(url, json=payload, timeout=20)
     except Exception as e:
         print(f"Telegram notification error: {e}")
 
 def fetch_indian_proxies():
-    # Massively expanded proxy sources to ensure a huge bench
     sources = [
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=IN&ssl=all&anonymity=all",
         "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
@@ -77,13 +86,13 @@ def get_verified_proxies(max_needed=12):
     return verified
 
 def block_heavy_assets(route):
-    if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+    # We allow images now just in case the dashboard needs them for the screenshot, but block media/fonts
+    if route.request.resource_type in ["media", "font"]:
         route.abort()
     else:
         route.continue_()
 
 def run_inspection():
-    # Attempt up to 12 proxies!
     proxies = get_verified_proxies(max_needed=12)
     if not proxies:
         proxies = [None]
@@ -94,7 +103,6 @@ def run_inspection():
         print(f"==================================================")
 
         with sync_playwright() as p:
-            # Anti-Reset flags to prevent Chromium from DDOSing the proxy
             launch_args = [
                 "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
                 "--ignore-certificate-errors", "--disable-http2", "--window-size=1920,1080",
@@ -151,18 +159,28 @@ def run_inspection():
                 if not success:
                     print("API payload not caught yet. Ensuring Emission tab is triggered...")
                     try:
-                        # Massive wait added to ensure slow proxies load the Angular base HTML
                         page.wait_for_selector(".ant-card, [role='tablist'], table", timeout=45000)
                         page.evaluate("""() => {
                             const tabs = Array.from(document.querySelectorAll('button, a, div, span, [role="tab"]'));
                             const emissionTab = tabs.find(el => el.textContent.trim().toUpperCase().includes('EMISSION'));
                             if (emissionTab) { emissionTab.click(); }
                         }""")
-                        print("Tab clicked! Waiting 15 full seconds for slow proxies to render the data...")
-                        page.wait_for_timeout(15000)
+                        print("Tab clicked! Waiting 10 seconds for rendering...")
+                        page.wait_for_timeout(10000)
                     except Exception as fallback_err:
                         print(f"Fallback UI navigation error: {fallback_err}")
                         pass
+
+                # ---------------------------------------------------------
+                # 📸 TAKE A SNAPSHOT OF THE CPCB DASHBOARD
+                # ---------------------------------------------------------
+                print("Taking a snapshot of the dashboard...")
+                screenshot_path = "dashboard_snapshot.png"
+                try:
+                    page.screenshot(path=screenshot_path, timeout=15000)
+                except Exception as e:
+                    print(f"Screenshot capture failed: {e}")
+                    screenshot_path = None
 
                 print("Extracting parameters...")
                 page_full_text = page.inner_text("body")
@@ -171,31 +189,39 @@ def run_inspection():
                 upper_body = master_data_pool.upper()
                 alert_reasons = []
 
-                # --- VARIABLES FOR THE ROUTINE REPORT ---
                 routine_val = "NA"
                 routine_time = "Unknown"
 
                 if "SIDDHI" not in upper_body and "MG/M" not in upper_body:
                     raise Exception("Proxy loaded a blank page or dropped connection mid-stream. Moving to next proxy.")
 
-                is_na_detected = any(pattern in upper_body for pattern in [
-                    " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE", '"NA"'
-                ])
-                if is_na_detected:
-                    alert_reasons.append("• Reading is reported as <b>NA</b>")
-
+                # ---------------------------------------------------------
+                # NUMBER PARSING BUG FIX (Numbers > Random NA text)
+                # ---------------------------------------------------------
                 emission_numbers = re.findall(r"[\"']?(\d+(?:\.\d+)?)[\"']?\s*[,:]?\s*[\"']?(?:mg/m|mg/nm|µg/m)[\"']?", master_data_pool, re.IGNORECASE)
                 if not emission_numbers:
                     emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)", page_full_text, re.IGNORECASE)
 
-                if emission_numbers and not is_na_detected:
+                if emission_numbers:
+                    # We found a valid number, ignore any random "NA" on the page
                     val = float(emission_numbers[0])
                     routine_val = f"{val} mg/m³" 
                     if val < THRESHOLD:
                         alert_reasons.append(f"• Emission value (<b>{val} mg/m³</b>) is below {THRESHOLD} mg/m³")
                     else:
                         print(f"Emission reading normal: {val} mg/m³ >= {THRESHOLD} mg/m³")
+                else:
+                    # ONLY if no numbers exist, check if it actually says "NA"
+                    is_na_detected = any(pattern in upper_body for pattern in [
+                        " NA\n", " NA ", "\nNA\n", "N/A", "N.A", "DATA NOT AVAILABLE", '"NA"'
+                    ])
+                    if is_na_detected:
+                        alert_reasons.append("• Reading is reported as <b>NA</b>")
+                        routine_val = "NA (Data Not Available)"
 
+                # ---------------------------------------------------------
+                # TIMESTAMP PARSING
+                # ---------------------------------------------------------
                 now_ist = datetime.now(IST)
                 timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", master_data_pool)
 
@@ -255,8 +281,10 @@ def run_inspection():
                         f"🕒 <b>Report Time:</b> {alert_time_str}\n"
                         f"🔗 <a href='{DIRECT_URL}'>Open CPCB Dashboard</a>"
                     )
-                    send_telegram(telegram_msg)
-                    print(f"Telegram notification sent! (Alert: {bool(alert_reasons)}, Scheduled: {is_scheduled})")
+                    
+                    # 📸 Send the message WITH the attached snapshot!
+                    send_telegram(telegram_msg, image_path=screenshot_path)
+                    print(f"Telegram notification sent WITH snapshot! (Alert: {bool(alert_reasons)}, Scheduled: {is_scheduled})")
                 else:
                     print("Status normal. All conditions within acceptable thresholds.")
 
