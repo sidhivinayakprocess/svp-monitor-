@@ -19,16 +19,17 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 IST = pytz.timezone("Asia/Kolkata")
 
 # ---------------------------------------------------------
-# DIRECT CPCB API ENDPOINT (Discovered via your cURL)
+# DIRECT CPCB API ENDPOINT
 # ---------------------------------------------------------
 API_URL = "https://cems.cpcb.gov.in/PUBLIC-DASHBOARD/v1/get_parameter_report"
 PAYLOAD = {
     "data": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpbmR1c3RyeV9pZCI6ImluZHVzdHJ5XzcyNTcifQ.0XdJ1rrvb82-IiAigOLmCuitSnlNExMIxXi1CVKOqF8"
 }
 HEADERS = {
+    "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json",
     "Origin": "https://cems.cpcb.gov.in",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
 def send_telegram(message: str):
@@ -63,39 +64,69 @@ def fetch_indian_proxies():
             continue
     return list(proxies)
 
-def fetch_data_via_proxy(proxy_url):
-    """Fires a direct 2KB API request. Bypasses the heavy visual frontend entirely."""
+def test_proxy_handshake(proxy_url):
+    """STRICT 6-SECOND SPEED TEST to weed out dead proxies before the Swarm."""
     try:
-        proxies = {"http": proxy_url, "https": proxy_url}
-        res = requests.post(API_URL, json=PAYLOAD, headers=HEADERS, proxies=proxies, timeout=12, verify=False)
-        if res.status_code == 200 and "{" in res.text:
-            return proxy_url, res.json()
+        r = requests.get("https://cems.cpcb.gov.in/public/", proxies={"http": proxy_url, "https": proxy_url}, timeout=6, verify=False)
+        if r.status_code == 200:
+            return proxy_url
     except:
         pass
+    return None
+
+def get_verified_proxies(max_needed=12):
+    candidates = fetch_indian_proxies()
+    print(f"Testing {len(candidates)} candidate proxies against strict 6-second Speed Test...")
+    verified = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
+        futures = {executor.submit(test_proxy_handshake, p): p for p in candidates}
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res:
+                verified.append(res)
+                print(f"Verified FAST Indian Gateway: {res}")
+                if len(verified) >= max_needed:
+                    break
+    return verified
+
+def fetch_data_via_proxy(proxy_url):
+    """Fires a direct 2KB API request bypassing the visual frontend."""
+    try:
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        res = requests.post(API_URL, json=PAYLOAD, headers=HEADERS, proxies=proxies, timeout=15, verify=False)
+        if res.status_code == 200 and "{" in res.text:
+            return proxy_url, res.json()
+        else:
+            print(f"Proxy {proxy_url} connected but returned HTTP {res.status_code}")
+    except Exception as e:
+        print(f"Proxy {proxy_url} API Tunnel error: {type(e).__name__}")
     return proxy_url, None
 
 def run_inspection():
-    candidates = fetch_indian_proxies()
-    print(f"Found {len(candidates)} proxies. Deploying API Swarm (testing all simultaneously)...")
-    
+    # 1. Get ONLY fast, verified proxies
+    verified_proxies = get_verified_proxies(max_needed=12)
+    if not verified_proxies:
+        print("No responsive proxies found; attempting direct connection anyway.")
+        verified_proxies = [None]
+        
+    print(f"\nDeploying API Swarm across {len(verified_proxies)} verified proxies...")
     api_data = None
     successful_proxy = None
     
-    # "THE SWARM": Launch the request across 60 proxies at the exact same time.
-    # The absolute fastest proxy to return the data wins, and the rest are instantly cancelled.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
-        futures = {executor.submit(fetch_data_via_proxy, p): p for p in candidates}
+    # 2. THE SWARM: Launch the POST request ONLY across the verified survivors
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(fetch_data_via_proxy, p): p for p in verified_proxies}
         for future in concurrent.futures.as_completed(futures):
             proxy, data = future.result()
             if data:
                 api_data = data
                 successful_proxy = proxy
-                print(f"SUCCESS! Raw JSON Database payload retrieved instantly via: {successful_proxy}")
+                print(f"\nSUCCESS! Raw JSON Database payload retrieved instantly via: {successful_proxy}")
                 executor.shutdown(wait=False, cancel_futures=True)
                 break
                 
     if not api_data:
-        print("All proxies failed to tunnel into the API. Retrying next cycle.")
+        print("\nAll verified proxies failed to tunnel the POST request. Retrying next cycle.")
         return
 
     print("Extracting exact numerical parameters from raw JSON dictionary...")
@@ -105,7 +136,7 @@ def run_inspection():
     routine_val = "NA"
     routine_time = "Unknown"
 
-    # Number logic: Extracts digits strictly tied to mg/m3 units in the JSON dictionary
+    # Strict numerical extraction for mg/m3
     emission_numbers = re.findall(r"(\d+(?:\.\d+)?).{0,30}?(?:MG/M|MG/NM|µG/M)", master_data_pool)
     
     if emission_numbers:
@@ -116,12 +147,11 @@ def run_inspection():
         else:
             print(f"Emission reading normal: {val} mg/m³ >= {THRESHOLD} mg/m³")
     else:
-        # Will only output NA if the database itself truly has no numeric data
         if "NA" in master_data_pool or "NOT AVAILABLE" in master_data_pool:
             alert_reasons.append("• Reading is reported as <b>NA</b>")
             routine_val = "NA (Data Not Available)"
 
-    # Timestamp logic (May 10th Date Bug strictly overridden)
+    # Strict Indian Date extraction
     now_ist = datetime.now(IST)
     timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})|(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", master_data_pool)
 
@@ -157,9 +187,7 @@ def run_inspection():
     else:
         print("Timestamp string not detected in raw API response.")
 
-    # ---------------------------------------------------------
-    # ROUTINE SCHEDULE TRIGGERS (11:00 AM, 3:00 PM, 9:30 PM)
-    # ---------------------------------------------------------
+    # Scheduled Routine Triggers
     is_scheduled = (now_ist.hour == 11 and now_ist.minute < 30) or \
                    (now_ist.hour == 15 and now_ist.minute < 30) or \
                    (now_ist.hour == 21 and now_ist.minute >= 30)
