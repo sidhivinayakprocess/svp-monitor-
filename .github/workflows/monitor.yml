@@ -1,43 +1,29 @@
-name: CPCB Emission Monitor
+name: CPCB 30-Min Emission Monitor
+
 on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
-concurrency:
-  group: cpcb-monitor
-  cancel-in-progress: false
+
 jobs:
   check-cpcb:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install system deps
+
+      - name: Install Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-      - name: Install Python deps
-        run: |
-          pip install playwright requests python-dateutil pytz playwright-stealth
+          pip install playwright requests python-dateutil pytz
           playwright install --with-deps chromium
-      - name: Run monitor (headed browser under virtual display)
+
+      - name: Run CPCB Check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CEMS_PROXY: ${{ secrets.CEMS_PROXY }}
-        run: xvfb-run -a python monitor.py
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diagnostics-${{ github.run_number }}
-          path: |
-            1_dashboard.png
-            2_site_info.png
-            3_emissions.png
-            error.png
-            3_emissions.html
-          if-no-files-found: ignore
+        run: python monitor.py
