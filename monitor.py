@@ -20,20 +20,17 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 IST = pytz.timezone("Asia/Kolkata")
 
 def send_telegram(message: str, image_path: str = None):
-    """Sends a Telegram message, with an optional photo attachment."""
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram keys missing.")
         return
     
     try:
         if image_path and os.path.exists(image_path):
-            # Send Photo with Caption
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
             with open(image_path, "rb") as photo:
                 payload = {"chat_id": CHAT_ID, "caption": message[:1024], "parse_mode": "HTML"}
                 requests.post(url, data=payload, files={"photo": photo}, timeout=30)
         else:
-            # Send Text Only
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
             payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
             requests.post(url, json=payload, timeout=20)
@@ -63,37 +60,39 @@ def fetch_indian_proxies():
 
 def test_proxy_handshake(proxy_url):
     try:
-        r = requests.get("https://cems.cpcb.gov.in/public/", proxies={"http": proxy_url, "https": proxy_url}, timeout=8, verify=False)
+        # MASSIVE FIX: Timeout dropped to 6 seconds. 
+        # This acts as a strict SPEED TEST. Only fast proxies survive.
+        r = requests.get("https://cems.cpcb.gov.in/public/", proxies={"http": proxy_url, "https": proxy_url}, timeout=6, verify=False)
         if r.status_code == 200:
             return proxy_url
     except:
         pass
     return None
 
-def get_verified_proxies(max_needed=12):
+def get_verified_proxies(max_needed=15):
     candidates = fetch_indian_proxies()
-    print(f"Testing {len(candidates)} candidate proxies against CPCB firewall...")
+    print(f"Testing {len(candidates)} candidate proxies against strict 6-second Speed Test...")
     verified = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
         futures = {executor.submit(test_proxy_handshake, p): p for p in candidates}
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
                 verified.append(res)
-                print(f"Verified live Indian Gateway: {res}")
+                print(f"Verified FAST Indian Gateway: {res}")
                 if len(verified) >= max_needed:
                     break
     return verified
 
 def block_heavy_assets(route):
-    # Allow images for the screenshot, but block heavy media/fonts
     if route.request.resource_type in ["media", "font"]:
         route.abort()
     else:
         route.continue_()
 
 def run_inspection():
-    proxies = get_verified_proxies(max_needed=12)
+    # Upped ammo to 15 proxies per run
+    proxies = get_verified_proxies(max_needed=15)
     if not proxies:
         proxies = [None]
 
@@ -159,7 +158,8 @@ def run_inspection():
                 if not success:
                     print("API payload not caught yet. Ensuring Emission tab is triggered...")
                     try:
-                        page.wait_for_selector(".ant-card, [role='tablist'], table", timeout=45000)
+                        # Extended patience for the UI to render: 60 seconds
+                        page.wait_for_selector(".ant-card, [role='tablist'], table", timeout=60000)
                         page.evaluate("""() => {
                             const tabs = Array.from(document.querySelectorAll('button, a, div, span, [role="tab"]'));
                             const emissionTab = tabs.find(el => el.textContent.trim().toUpperCase().includes('EMISSION'));
@@ -171,9 +171,6 @@ def run_inspection():
                         print(f"Fallback UI navigation error: {fallback_err}")
                         pass
 
-                # ---------------------------------------------------------
-                # 📸 TAKE A SNAPSHOT OF THE CPCB DASHBOARD
-                # ---------------------------------------------------------
                 print("Taking a snapshot of the dashboard...")
                 screenshot_path = "dashboard_snapshot.png"
                 try:
@@ -195,7 +192,6 @@ def run_inspection():
                 if "SIDDHI" not in upper_body and "MG/M" not in upper_body:
                     raise Exception("Proxy loaded a blank page or dropped connection mid-stream. Moving to next proxy.")
 
-                # Number logic fixes "NA" false flags
                 emission_numbers = re.findall(r"[\"']?(\d+(?:\.\d+)?)[\"']?\s*[,:]?\s*[\"']?(?:mg/m|mg/nm|µg/m)[\"']?", master_data_pool, re.IGNORECASE)
                 if not emission_numbers:
                     emission_numbers = re.findall(r"(\d+(?:\.\d+)?)\s*(?:mg/m|mg/nm|µg/m)", page_full_text, re.IGNORECASE)
@@ -215,7 +211,6 @@ def run_inspection():
                         alert_reasons.append("• Reading is reported as <b>NA</b>")
                         routine_val = "NA (Data Not Available)"
 
-                # Correctly handles the May 10th Date bug
                 now_ist = datetime.now(IST)
                 timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", master_data_pool)
 
@@ -250,7 +245,6 @@ def run_inspection():
                     if not success:
                         raise Exception("Failed to extract data payload. Proxy likely dropped connection mid-stream.")
 
-                # Scheduled Report Logic
                 is_scheduled = (now_ist.hour == 11 and now_ist.minute < 30) or \
                                (now_ist.hour == 15 and now_ist.minute < 30) or \
                                (now_ist.hour == 21 and now_ist.minute >= 30)
