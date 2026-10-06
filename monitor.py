@@ -1,349 +1,408 @@
+import concurrent.futures
+import json
 import os
 import re
-import json
-import concurrent.futures
+import time
 from datetime import datetime
-import requests
+
 import pytz
-from dateutil import parser
-from playwright.sync_api import sync_playwright
+import requests
 import urllib3
+from playwright.sync_api import sync_playwright
 
 urllib3.disable_warnings()
 
-DIRECT_URL = "https://cems.cpcb.gov.in/public/#/l/dashboard/site-info/eyJvYmoiOiJpbmR1c3RyeV83MjU3In0="
-TARGET_INDUSTRY = "SIDDHI VINAYAK PROCESS"
-THRESHOLD = 5.0
-DELAY_THRESHOLD_HOURS = 1.0
-
+IST = pytz.timezone("Asia/Kolkata")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-IST = pytz.timezone("Asia/Kolkata")
 
-def send_telegram(message: str, image_path: str = None):
+DASH_URL = os.environ.get(
+    "DASH_URL",
+    "https://cems.cpcb.gov.in/public/#/l/dashboard/site-info/"
+    "eyJvYmoiOiJpbmR1c3RyeV83MjU3In0=",
+)
+DELAY_LIMIT_HOURS = float(os.environ.get("DELAY_LIMIT_HOURS", "1"))
+NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "90000"))
+PROXY_SERVER = os.environ.get("CEMS_PROXY")          # http://user:pass@host:port
+DISCOVER = os.environ.get("DISCOVER", "0") == "1"
+ALWAYS_NOTIFY = os.environ.get("ALWAYS_NOTIFY", "1") == "1"
+BLOCK_ASSETS = os.environ.get("BLOCK_ASSETS", "0") == "1"
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+
+FREE_PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http"
+    "&timeout=10000&country=IN&ssl=all&anonymity=all",
+    "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
+    "https://www.proxy-list.download/api/v1/get?type=https&country=IN",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+]
+
+# ---------------------------------------------------------------- telegram ---
+def tg(method, **kwargs):
     if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram keys missing.")
-        return
-    
+        print("!! TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — skipping notify")
+        return False
     try:
-        if image_path and os.path.exists(image_path):
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-            with open(image_path, "rb") as photo:
-                payload = {"chat_id": CHAT_ID, "caption": message[:1024], "parse_mode": "HTML"}
-                requests.post(url, data=payload, files={"photo": photo}, timeout=30)
-        else:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-            requests.post(url, json=payload, timeout=20)
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                          timeout=30, **kwargs)
+        ok = r.status_code == 200 and r.json().get("ok")
+        if not ok:
+            print(f"!! Telegram {method} failed: {r.status_code} {r.text[:300]}")
+        return ok
     except Exception as e:
-        print(f"Telegram notification error: {e}")
+        print(f"!! Telegram {method} error: {e}")
+        return False
 
-def fetch_indian_proxies():
-    sources = [
-        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=IN&ssl=all&anonymity=all",
-        "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
-        "https://www.proxy-list.download/api/v1/get?type=https&country=IN",
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-        "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
-        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt"
-    ]
-    proxies = set()
-    print("Scraping active Indian HTTP proxies...")
-    for src in sources:
+
+def send_text(msg):
+    return tg("sendMessage", json={
+        "chat_id": CHAT_ID, "text": msg[:4096],
+        "parse_mode": "HTML", "disable_web_page_preview": True})
+
+
+def send_photo(path, caption=""):
+    if not path or not os.path.exists(path):
+        return send_text(caption)
+    try:
+        with open(path, "rb") as fh:
+            return tg("sendPhoto",
+                      data={"chat_id": CHAT_ID, "caption": caption[:1024],
+                            "parse_mode": "HTML"},
+                      files={"photo": fh})
+    except Exception as e:
+        print(f"!! sendPhoto error: {e}")
+        return send_text(caption)
+
+
+# ----------------------------------------------------------------- proxies ---
+def fetch_free_proxies():
+    found = set()
+    for src in FREE_PROXY_SOURCES:
         try:
             r = requests.get(src, timeout=8)
             if r.status_code == 200:
-                for match in re.finditer(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", r.text):
-                    proxies.add(f"http://{match.group(0)}")
-        except:
+                for m in re.finditer(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", r.text):
+                    found.add("http://" + m.group(0))
+        except Exception:
             continue
-    return list(proxies)
+    return list(found)
 
-def test_proxy_handshake(proxy_url):
-    """STRICT 6-SECOND SPEED TEST to weed out dead proxies."""
+
+def check_proxy(p):
     try:
-        r = requests.get("https://cems.cpcb.gov.in/public/", proxies={"http": proxy_url, "https": proxy_url}, timeout=6, verify=False)
-        if r.status_code == 200:
-            return proxy_url
-    except:
-        pass
-    return None
-
-def get_verified_proxies(max_needed=10):
-    candidates = fetch_indian_proxies()
-    print(f"Testing {len(candidates)} candidate proxies against strict 6-second Speed Test...")
-    verified = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
-        futures = {executor.submit(test_proxy_handshake, p): p for p in candidates}
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                verified.append(res)
-                print(f"Verified FAST Indian Gateway: {res}")
-                if len(verified) >= max_needed:
-                    break
-    return verified
-
-def block_heavy_assets(route):
-    # CRITICAL: We block ALL heavy visuals (images, css, fonts, videos) during the wiretap phase.
-    # This prevents the free proxies from timing out while allowing the background JSON to load.
-    if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
-        route.abort()
-    else:
-        route.continue_()
-
-def generate_local_dashboard_and_screenshot(routine_val, routine_time, raw_json_text, is_alert, reasons_text, output_path="dashboard_snapshot.png"):
-    """Generates a beautiful local HTML dashboard and snaps a picture instantly using a NON-PROXIED browser."""
-    status_color = "#d9363e" if (is_alert and 'below' in reasons_text) else "#52c41a"
-    delay_color = "#d9363e" if (is_alert and 'delayed' in reasons_text) else "#52c41a"
-    
-    # Try to make the JSON look pretty, fallback to raw text if it fails
-    try:
-        json_obj = json.loads(raw_json_text)
-        pretty_json = json.dumps(json_obj, indent=4)
-    except:
-        pretty_json = raw_json_text
-
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; color: #333; padding: 40px; margin: 0; }}
-            .container {{ background: #fff; border-radius: 12px; padding: 30px; box-shadow: 0 8px 24px rgba(0,0,0,0.1); max-width: 900px; margin: auto; border-top: 6px solid #1890ff; }}
-            .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #f0f0f0; padding-bottom: 20px; margin-bottom: 20px; }}
-            .header h1 {{ margin: 0; color: #1890ff; font-size: 28px; }}
-            .meta {{ color: #888; font-size: 14px; font-weight: 500; }}
-            .widget-grid {{ display: flex; gap: 20px; margin-bottom: 30px; }}
-            .widget {{ flex: 1; background: #fafafa; border: 1px solid #e8e8e8; border-radius: 8px; padding: 20px; text-align: center; }}
-            .widget-title {{ font-size: 14px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }}
-            .widget-value {{ font-size: 36px; font-weight: bold; }}
-            .raw-data {{ background: #282c34; padding: 20px; border-radius: 8px; font-family: 'Courier New', Courier, monospace; font-size: 14px; color: #abb2bf; white-space: pre-wrap; word-wrap: break-word; }}
-            .footer {{ margin-top: 20px; font-size: 12px; color: #aaa; text-align: center; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>🏭 SIDDHI VINAYAK PROCESS</h1>
-                <div class="meta">Live CEMS Telemetry Dashboard • ID: 7257</div>
-            </div>
-            <div class="widget-grid">
-                <div class="widget">
-                    <div class="widget-title">Current Emission</div>
-                    <div class="widget-value" style="color: {status_color};">{routine_val}</div>
-                </div>
-                <div class="widget">
-                    <div class="widget-title">Last Received</div>
-                    <div class="widget-value" style="color: {delay_color}; font-size: 24px; padding-top: 10px;">{routine_time}</div>
-                </div>
-            </div>
-            <div class="widget-title" style="text-align: left;">Raw Database Payload intercepted from CPCB Network</div>
-            <div class="raw-data">{pretty_json}</div>
-            <div class="footer">Generated offline via secure data wiretap to prevent proxy timeouts</div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    html_path = os.path.abspath("local_dashboard.html")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-        
-    print("Launching OFFLINE Playwright renderer for lightning-fast screenshot...")
-    try:
-        # NO PROXY USED HERE! This executes locally on the GitHub server.
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(set_viewport_size={"width": 1000, "height": 850})
-            page.goto(f"file://{html_path}")
-            page.screenshot(path=output_path, full_page=True)
-            browser.close()
-        print("✅ Local screenshot captured successfully.")
-        return output_path
-    except Exception as e:
-        print(f"Failed to render local screenshot: {e}")
+        r = requests.get("https://cems.cpcb.gov.in/public/",
+                         proxies={"http": p, "https": p},
+                         timeout=8, verify=False)
+        return p if r.status_code == 200 else None
+    except Exception:
         return None
 
-def run_inspection():
-    proxies = get_verified_proxies(max_needed=10)
+
+def good_proxies(n=8):
+    cands = fetch_free_proxies()
+    print(f"Testing {len(cands)} free Indian proxies (8s each)…")
+    out = []
+    if not cands:
+        return out
+    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+        futs = {ex.submit(check_proxy, p): p for p in cands}
+        for fut in concurrent.futures.as_completed(futs):
+            res = fut.result()
+            if res:
+                out.append(res)
+                print(f"  ok: {res}")
+                if len(out) >= n:
+                    break
+    return out
+
+
+# ------------------------------------------------------------ browser wiretap
+def capture(proxy_server):
+    """Return list of (url, body) for every XHR/fetch response seen."""
+    captured = []
+    with sync_playwright() as p:
+        kw = dict(headless=True, args=[
+            "--no-sandbox", "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage", "--ignore-certificate-errors"])
+        if proxy_server:
+            kw["proxy"] = {"server": proxy_server}
+        browser = p.chromium.launch(**kw)
+        ctx = browser.new_context(user_agent=UA,
+                                  viewport={"width": 1920, "height": 1080},
+                                  ignore_https_errors=True)
+        page = ctx.new_page()
+        page.set_default_timeout(NAV_TIMEOUT_MS)
+
+        if BLOCK_ASSETS:
+            page.route("**/*", lambda route: route.abort()
+                       if route.request.resource_type in ("image", "media", "font")
+                       else route.continue_())
+
+        def on_response(resp):
+            try:
+                if resp.request.resource_type not in ("xhr", "fetch"):
+                    return
+                txt = resp.text()
+                if txt and ("{" in txt or "[" in txt):
+                    captured.append((resp.url, txt))
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        try:
+            page.goto(DASH_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        except Exception as e:
+            print(f"goto warning: {e}")
+
+        # best-effort: open the Emissions tab so its XHR fires
+        for sel in ["text=/emission/i", "[role=tab]:has-text('Emission')",
+                    "a:has-text('Emission')"]:
+            try:
+                loc = page.locator(sel).first
+                if loc.count():
+                    loc.click(timeout=5000)
+                    page.wait_for_timeout(3000)
+                    break
+            except Exception:
+                pass
+
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            page.wait_for_timeout(2000)
+            if captured:
+                break
+
+        browser.close()
+    return captured
+
+
+# ---------------------------------------------------------------- parsing ----
+VALUE_KEYS = ("value", "reading", "val", "measuredvalue", "finalvalue",
+              "concentration", "avg", "average", "result")
+UNIT_KEYS = ("unit", "units", "uom")
+TIME_KEYS = ("timestamp", "datetime", "receivedtime", "lastreceived",
+             "last_received", "lttime", "sttime", "time", "date")
+PARAM_KEYS = ("parameter", "param", "parametername", "pollutant", "name")
+
+
+def norm_unit(u):
+    if not u:
+        return ""
+    return (str(u).lower().replace("µ", "u").replace("μ", "u")
+            .replace("³", "3").replace(" ", ""))
+
+
+def is_na(v):
+    if v is None:
+        return True
+    return str(v).strip().lower() in (
+        "", "na", "n/a", "null", "none", "nan", "-", "--", "not available")
+
+
+def get_field(d, keys):
+    low = {str(k).lower(): v for k, v in d.items()}
+    for k in keys:
+        if k in low and low[k] not in (None, ""):
+            return low[k]
+    return None
+
+
+def walk(node, out):
+    if isinstance(node, dict):
+        vk = any(k in {str(x).lower() for x in node} for k in VALUE_KEYS)
+        uk = any(k in {str(x).lower() for x in node} for k in UNIT_KEYS)
+        if vk and uk:
+            out.append(node)
+        for v in node.values():
+            walk(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            walk(v, out)
+
+
+def parse_dt(v):
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)) or (isinstance(v, str) and re.fullmatch(r"\d{10,13}", v.strip())):
+        n = float(v)
+        if n > 1e12:           # milliseconds
+            n /= 1000.0
+        try:
+            return datetime.fromtimestamp(n, IST)
+        except Exception:
+            return None
+    s = str(v).strip().replace("/", "-")
+    try:
+        from dateutil import parser as dparser
+        dt = dparser.parse(s, dayfirst=True)
+        return IST.localize(dt) if dt.tzinfo is None else dt.astimezone(IST)
+    except Exception:
+        return None
+
+
+def parse_all(captured):
+    readings = []
+    for url, text in captured:
+        try:
+            data = json.loads(text)
+        except Exception:
+            continue
+        bucket = []
+        walk(data, bucket)
+        for rec in bucket:
+            readings.append((url, rec))
+    return readings
+
+
+def choose_emission(readings):
+    """Pick the most emissions-like mg/m3 record (paired value+unit+time)."""
+    best = None
+    for url, rec in readings:
+        nu = norm_unit(get_field(rec, UNIT_KEYS))
+        if "mg/m3" not in nu and "ug/m3" not in nu and "mg/nm3" not in nu:
+            continue
+        name = get_field(rec, PARAM_KEYS) or ""
+        score = 2 if "mg/m3" in nu else 1
+        if parse_dt(get_field(rec, TIME_KEYS)):
+            score += 3
+        if any(p in str(name).lower() for p in
+               ("pm", "so2", "nox", "co", "stack", "spm", "tpm")):
+            score += 1
+        cand = {"value": get_field(rec, VALUE_KEYS), "unit": get_field(rec, UNIT_KEYS),
+                "dt": parse_dt(get_field(rec, TIME_KEYS)), "name": name,
+                "url": url, "score": score}
+        if best is None or cand["score"] > best["score"]:
+            best = cand
+    return best
+
+
+# --------------------------------------------------------------- screenshot --
+def render_local(html, out="dashboard_snapshot.png"):
+    path = os.path.abspath("local_dashboard.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    try:
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True,
+                                  args=["--no-sandbox", "--disable-dev-shm-usage"])
+            pg = b.new_page(viewport={"width": 1000, "height": 700})
+            pg.goto("file://" + path)
+            pg.screenshot(path=out, full_page=True)
+            b.close()
+        return out
+    except Exception as e:
+        print(f"screenshot failed: {e}")
+        return None
+
+
+def make_html(value, when, is_alert):
+    color = "#d9363e" if is_alert else "#52c41a"
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body{{font-family:Segoe UI,Arial,sans-serif;background:#f0f2f5;padding:40px;margin:0}}
+.card{{background:#fff;border-radius:12px;padding:28px;max-width:760px;margin:auto;
+box-shadow:0 8px 24px rgba(0,0,0,.1);border-top:6px solid #1890ff}}
+h1{{color:#1890ff;font-size:24px;margin:0 0 16px}}
+.w{{display:flex;gap:20px}} .b{{flex:1;background:#fafafa;border:1px solid #e8e8e8;
+border-radius:8px;padding:18px;text-align:center}}
+.t{{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px}}
+.v{{font-size:32px;font-weight:700;color:{color}}}
+</style></head><body><div class="card">
+<h1>🏭 SIDDHI VINAYAK PROCESS — CEMS</h1>
+<div class="w"><div class="b"><div class="t">Emission</div><div class="v">{value}</div></div>
+<div class="b"><div class="t">Last Received</div>
+<div class="v" style="font-size:20px">{when}</div></div></div></div></body></html>"""
+
+
+# -------------------------------------------------------------------- main ---
+def dump_discovery(captured):
+    lines = []
+    for url, body in captured:
+        endpoint = url.split("?")[0]
+        lines.append(f"{url}\n  -> {body[:800]}\n")
+    text = "\n".join(lines) or "NO XHR/fetch responses captured."
+    with open("discovered_endpoints.txt", "w", encoding="utf-8") as f:
+        f.write(text)
+    print(text[:6000])
+    # also ship the top candidates straight to Telegram
+    seen = []
+    for url, _ in captured:
+        e = url.split("?")[0]
+        if e not in seen:
+            seen.append(e)
+    if seen:
+        send_text("🔎 <b>XHR endpoints seen</b>\n" + "\n".join(f"<code>{e}</code>" for e in seen[:25]))
+
+
+def main():
+    proxies = [PROXY_SERVER] if PROXY_SERVER else good_proxies(8)
     if not proxies:
-        print("No fast proxies found, attempting direct connection...")
+        print("No proxy available — trying direct (works only from an Indian IP).")
         proxies = [None]
 
-    master_data_pool = None
+    captured = []
+    for i, prox in enumerate(proxies, 1):
+        print(f"--- attempt {i}/{len(proxies)}  proxy={prox} ---")
+        try:
+            captured = capture(prox)
+        except Exception as e:
+            print(f"capture failed: {e}")
+            captured = []
+        if captured:
+            break
 
-    # =========================================================================
-    # STAGE 1: THE WIRETAP (Using Proxies to bypass WAF and steal JSON)
-    # =========================================================================
-    for attempt, proxy in enumerate(proxies, 1):
-        print(f"\n==================================================")
-        print(f"STAGE 1 (WIRETAP) ATTEMPT {attempt}/{len(proxies)} -> Proxy: {proxy}")
-        print(f"==================================================")
-
-        with sync_playwright() as p:
-            launch_args = [
-                "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-                "--ignore-certificate-errors", "--disable-http2"
-            ]
-            launch_opts = {"headless": True, "args": launch_args}
-            if proxy:
-                launch_opts["proxy"] = {"server": proxy}
-
-            try:
-                browser = p.chromium.launch(**launch_opts)
-            except Exception as e:
-                print(f"Browser launch failed. Error: {e}")
-                continue
-
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                ignore_https_errors=True
-            )
-            page = context.new_page()
-            page.set_default_timeout(120000)
-            
-            # Massive bandwidth saver for the proxy
-            page.route("**/*", block_heavy_assets)
-
-            captured_api_data = []
-            
-            # THE BUG FIX: Capture all JSON. Do NOT filter by "7257" because the response body doesn't contain the ID!
-            def intercept_api_responses(response):
-                if response.request.resource_type in ["xhr", "fetch"]:
-                    try:
-                        text = response.text()
-                        if "{" in text:
-                            captured_api_data.append(text)
-                    except:
-                        pass
-                        
-            page.on("response", intercept_api_responses)
-
-            try:
-                print("Navigating to Golden Link over secure Chromium tunnel (Bypassing WAF)...")
-                page.goto(DIRECT_URL, wait_until="commit", timeout=120000)
-
-                print("Waiting up to 45 seconds for API JSON data containing 'MG/M3' to arrive...")
-                got_data = False
-                for _ in range(15):
-                    page.wait_for_timeout(3000)
-                    combined_json = "\n".join(captured_api_data).upper()
-                    
-                    if "MG/M" in combined_json or "MG/NM" in combined_json or "µG/M" in combined_json:
-                        print("✅ SUCCESS! Intercepted API numerical data through the human-mimic tunnel.")
-                        got_data = True
-                        master_data_pool = combined_json
-                        break
-
-                if not got_data:
-                    raise Exception("Failed to find numerical data payload. Moving to next proxy.")
-                
-                # Close the browser immediately to drop the proxy connection!
-                browser.close()
-                break # Exit the proxy loop! We have the data!
-
-            except Exception as e:
-                print(f"Iteration attempt failed on proxy {proxy}: {str(e)[:250]}")
-            finally:
-                if browser.is_connected():
-                    browser.close()
-
-    if not master_data_pool:
-        print("\nAll gateway proxies were exhausted during this cycle. The scheduler will retry automatically in 30 minutes.")
+    if DISCOVER:
+        dump_discovery(captured)
         return
 
-    # =========================================================================
-    # STAGE 2: OFFLINE PROCESSING & SCREENSHOT
-    # =========================================================================
-    print("\nExtracting precise parameters from intercepted JSON...")
-    
-    alert_reasons = []
-    routine_val = "NA"
-    routine_time = "Unknown"
+    now = datetime.now(IST)
+    reading = choose_emission(parse_all(captured))
 
-    # Extract numbers (e.g. captures 4.2 from "VALUE": 4.2, "UNIT": "MG/M3")
-    emission_numbers = re.findall(r"(\d+(?:\.\d+)?).{0,30}?(?:MG/M|MG/NM|µG/M)", master_data_pool)
-    
-    if emission_numbers:
-        val = float(emission_numbers[0])
-        routine_val = f"{val} mg/m³" 
-        if val < THRESHOLD:
-            alert_reasons.append(f"• Emission value (<b>{val} mg/m³</b>) is below {THRESHOLD} mg/m³")
-        else:
-            print(f"Emission reading normal: {val} mg/m³ >= {THRESHOLD} mg/m³")
+    if reading is None:
+        send_text(
+            "⚠️ <b>CPCB Monitor: no emission reading found</b>\n\n"
+            f"Captured <b>{len(captured)}</b> XHR responses, none with an mg/m³ value.\n"
+            "Re-run with <code>DISCOVER=1</code> to dump the payloads.")
+        print("FAILED: no mg/m3 reading parsed.")
+        return
+
+    value, dt = reading["value"], reading["dt"]
+    na = is_na(value)
+    when = dt.strftime("%d %b %Y, %I:%M %p IST") if dt else "Unknown"
+
+    reasons = []
+    if na:
+        reasons.append(f"• Reading is <b>NA</b> ({reading['unit'] or 'mg/m³'})")
+    if dt is None:
+        reasons.append("• Could not read the sample timestamp")
     else:
-        if "NA" in master_data_pool or "NOT AVAILABLE" in master_data_pool:
-            alert_reasons.append("• Reading is reported as <b>NA</b>")
-            routine_val = "NA (Data Not Available)"
+        delay = (now - dt).total_seconds() / 3600.0
+        if delay >= DELAY_LIMIT_HOURS:
+            reasons.append(f"• Telemetry delayed <b>{int(delay)}h "
+                           f"{int((delay % 1) * 60)}m</b> (last: {when})")
 
-    # Extract Timestamp
-    now_ist = datetime.now(IST)
-    timestamp_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})|(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})|(\d{2}[/-]\d{2}[/-]\d{4}\s\d{2}:\d{2})", master_data_pool)
+    is_alert = bool(reasons)
+    head = "⚠️ <b>CPCB Emission Alert</b>" if is_alert else "✅ <b>CPCB Monitor — healthy</b>"
+    body = (f"{head}\n\n🏭 <b>Industry:</b> SIDDHI VINAYAK PROCESS\n\n"
+            f"<b>Reading:</b> {'NA' if na else str(value)} {reading['unit'] or 'mg/m³'}\n"
+            f"<b>Last Received:</b> {when}\n")
+    if reading.get("name"):
+        body += f"<b>Parameter:</b> {reading['name']}\n"
+    if reasons:
+        body += "\n<b>Triggers:</b>\n" + "\n".join(reasons) + "\n"
+    body += f"\n🕒 Report: {now.strftime('%I:%M %p, %d %b %Y')} IST"
 
-    if timestamp_match:
-        raw_ts_str = timestamp_match.group(0).strip()
-        try:
-            try:
-                parsed_dt = datetime.strptime(raw_ts_str, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                try:
-                    parsed_dt = datetime.strptime(raw_ts_str, "%Y-%m-%d %H:%M")
-                except ValueError:
-                    try:
-                        parsed_dt = datetime.strptime(raw_ts_str.replace('/', '-'), "%d-%m-%Y %H:%M")
-                    except ValueError:
-                        parsed_dt = parser.parse(raw_ts_str)
+    if not is_alert and not ALWAYS_NOTIFY:
+        print("Healthy and ALWAYS_NOTIFY=0 — no message sent.")
+        return
 
-            last_received_ist = IST.localize(parsed_dt) if parsed_dt.tzinfo is None else parsed_dt.astimezone(IST)
-            routine_time = last_received_ist.strftime('%d %b %Y, %I:%M %p')
-            
-            time_diff = now_ist - last_received_ist
-            delay_hours = time_diff.total_seconds() / 3600.0
+    shot = render_local(make_html(("NA" if na else str(value)), when, is_alert))
+    send_photo(shot, body) if shot else send_text(body)
+    print(f"Sent. alert={is_alert} na={na} delay_ok={not reasons}")
 
-            print(f"Current IST: {now_ist.strftime('%Y-%m-%d %H:%M')}")
-            print(f"Last Received: {last_received_ist.strftime('%Y-%m-%d %H:%M')} (Delay: {delay_hours:.2f} hrs)")
-
-            if delay_hours >= DELAY_THRESHOLD_HOURS:
-                h = int(time_diff.total_seconds() // 3600)
-                m = int((time_diff.total_seconds() % 3600) // 60)
-                alert_reasons.append(f"• Telemetry delayed by <b>{h}h {m}m</b> (Last received: {routine_time})")
-        except Exception as parse_err:
-            print(f"Timestamp parsing error: {parse_err}")
-    else:
-        print("Timestamp string not detected.")
-
-    is_alert = bool(alert_reasons)
-    reasons_text = "\n".join(alert_reasons) if is_alert else ""
-
-    # Launch Stage 2 Screenshot (Requires ZERO Proxy Bandwidth)
-    screenshot_path = generate_local_dashboard_and_screenshot(routine_val, routine_time, master_data_pool, is_alert, reasons_text)
-
-    is_scheduled = (now_ist.hour == 11 and now_ist.minute < 30) or \
-                   (now_ist.hour == 15 and now_ist.minute < 30) or \
-                   (now_ist.hour == 21 and now_ist.minute >= 30)
-
-    if alert_reasons or is_scheduled:
-        alert_time_str = now_ist.strftime("%I:%M %p (%d %b %Y)")
-        header = "⚠️ <b>CPCB Emission Alert</b>" if alert_reasons else "📊 <b>Scheduled Routine Update</b>"
-        
-        triggers_text = f"<b>Triggers:</b>\n{reasons_text}\n\n" if alert_reasons else ""
-            
-        telegram_msg = (
-            f"{header}\n\n"
-            f"🏭 <b>Industry:</b> {TARGET_INDUSTRY}\n\n"
-            f"<b>Current Reading:</b> {routine_val}\n"
-            f"<b>Last Received:</b> {routine_time}\n\n"
-            f"{triggers_text}"
-            f"🕒 <b>Report Time:</b> {alert_time_str}\n"
-            f"🔗 <a href='https://cems.cpcb.gov.in/#/public-dashboard'>Open CPCB Dashboard</a>"
-        )
-        
-        send_telegram(telegram_msg, image_path=screenshot_path)
-        print(f"Telegram notification sent WITH local snapshot! (Alert: {is_alert}, Scheduled: {is_scheduled})")
-    else:
-        print("Status normal. All conditions within acceptable thresholds.")
 
 if __name__ == "__main__":
-    run_inspection()
+    main()
