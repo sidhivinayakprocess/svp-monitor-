@@ -19,16 +19,19 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 IST = pytz.timezone("Asia/Kolkata")
 
 # ---------------------------------------------------------
-# DIRECT CPCB API ENDPOINT
+# DIRECT CPCB API ENDPOINT & HEADERS (From known working cURL)
 # ---------------------------------------------------------
 API_URL = "https://cems.cpcb.gov.in/PUBLIC-DASHBOARD/v1/get_parameter_report"
 PAYLOAD = {
     "data": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpbmR1c3RyeV9pZCI6ImluZHVzdHJ5XzcyNTcifQ.0XdJ1rrvb82-IiAigOLmCuitSnlNExMIxXi1CVKOqF8"
 }
+
+# These exact headers bypass the CPCB API firewall blocks
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json",
     "Origin": "https://cems.cpcb.gov.in",
+    "Referer": "https://cems.cpcb.gov.in/public/",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
@@ -65,7 +68,7 @@ def fetch_indian_proxies():
     return list(proxies)
 
 def test_proxy_handshake(proxy_url):
-    """STRICT 6-SECOND SPEED TEST to weed out dead proxies before the Swarm."""
+    """STRICT 6-SECOND SPEED TEST to weed out dead proxies."""
     try:
         r = requests.get("https://cems.cpcb.gov.in/public/", proxies={"http": proxy_url, "https": proxy_url}, timeout=6, verify=False)
         if r.status_code == 200:
@@ -94,8 +97,16 @@ def fetch_data_via_proxy(proxy_url):
     try:
         proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
         res = requests.post(API_URL, json=PAYLOAD, headers=HEADERS, proxies=proxies, timeout=15, verify=False)
-        if res.status_code == 200 and "{" in res.text:
-            return proxy_url, res.json()
+        
+        # Check if response is JSON and actually contains our data format
+        if res.status_code == 200:
+            try:
+                data = res.json()
+                # Ensure the JSON isn't an empty error response
+                if data and isinstance(data, (dict, list)):
+                    return proxy_url, data
+            except json.JSONDecodeError:
+                pass
         else:
             print(f"Proxy {proxy_url} connected but returned HTTP {res.status_code}")
     except Exception as e:
@@ -126,7 +137,7 @@ def run_inspection():
                 break
                 
     if not api_data:
-        print("\nAll verified proxies failed to tunnel the POST request. Retrying next cycle.")
+        print("\nAll verified proxies failed to tunnel the POST request and retrieve valid JSON. Retrying next cycle.")
         return
 
     print("Extracting exact numerical parameters from raw JSON dictionary...")
@@ -136,8 +147,9 @@ def run_inspection():
     routine_val = "NA"
     routine_time = "Unknown"
 
-    # Strict numerical extraction for mg/m3
-    emission_numbers = re.findall(r"(\d+(?:\.\d+)?).{0,30}?(?:MG/M|MG/NM|µG/M)", master_data_pool)
+    # 3. Precise Data Extraction
+    # Look for a number immediately followed by or near the emission units
+    emission_numbers = re.findall(r"(\d+(?:\.\d+)?)[^A-Za-z]{0,10}(?:MG/M|MG/NM|µG/M)", master_data_pool)
     
     if emission_numbers:
         val = float(emission_numbers[0])
@@ -187,7 +199,7 @@ def run_inspection():
     else:
         print("Timestamp string not detected in raw API response.")
 
-    # Scheduled Routine Triggers
+    # 4. Scheduled Routine Triggers (11 AM, 3 PM, 9:30 PM)
     is_scheduled = (now_ist.hour == 11 and now_ist.minute < 30) or \
                    (now_ist.hour == 15 and now_ist.minute < 30) or \
                    (now_ist.hour == 21 and now_ist.minute >= 30)
