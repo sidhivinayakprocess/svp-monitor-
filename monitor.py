@@ -1,6 +1,6 @@
 import concurrent.futures
-import json
 import os
+import random
 import re
 import time
 from datetime import datetime
@@ -9,400 +9,294 @@ import pytz
 import requests
 import urllib3
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 urllib3.disable_warnings()
 
 IST = pytz.timezone("Asia/Kolkata")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-DASH_URL = os.environ.get(
-    "DASH_URL",
-    "https://cems.cpcb.gov.in/public/#/l/dashboard/site-info/"
-    "eyJvYmoiOiJpbmR1c3RyeV83MjU3In0=",
-)
-DELAY_LIMIT_HOURS = float(os.environ.get("DELAY_LIMIT_HOURS", "1"))
-NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "90000"))
-PROXY_SERVER = os.environ.get("CEMS_PROXY")          # http://user:pass@host:port
-DISCOVER = os.environ.get("DISCOVER", "0") == "1"
-ALWAYS_NOTIFY = os.environ.get("ALWAYS_NOTIFY", "1") == "1"
-BLOCK_ASSETS = os.environ.get("BLOCK_ASSETS", "0") == "1"
-
+CEMS_PROXY = os.environ.get("CEMS_PROXY")   # optional; else free Indian proxies
+INDUSTRY = "SIDDHI VINAYAK PROCESS"
+DASH_URL = ("https://cems.cpcb.gov.in/public/#/"
+            "l/realtime-connectivity-status-dashboard")
+DELAY_LIMIT_HOURS = 1.0
+NAV_TIMEOUT_MS = 45000
+PER_ATTEMPT_S = 150
+MAX_ATTEMPTS = 4
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 FREE_PROXY_SOURCES = [
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http"
-    "&timeout=10000&country=IN&ssl=all&anonymity=all",
+    "&timeout=5000&country=IN&ssl=all&anonymity=all",
     "https://www.proxy-list.download/api/v1/get?type=http&country=IN",
-    "https://www.proxy-list.download/api/v1/get?type=https&country=IN",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-Lists/master/http.txt",
 ]
 
-# ---------------------------------------------------------------- telegram ---
+# ------------------------------------------------------------ telegram ------
 def tg(method, **kwargs):
     if not BOT_TOKEN or not CHAT_ID:
-        print("!! TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — skipping notify")
-        return False
+        print("!! Telegram creds missing — skipping notify"); return False
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
                           timeout=30, **kwargs)
         ok = r.status_code == 200 and r.json().get("ok")
         if not ok:
-            print(f"!! Telegram {method} failed: {r.status_code} {r.text[:300]}")
+            print(f"!! Telegram {method}: {r.status_code} {r.text[:200]}")
         return ok
     except Exception as e:
-        print(f"!! Telegram {method} error: {e}")
-        return False
+        print(f"!! Telegram error: {e}"); return False
 
-
-def send_text(msg):
-    return tg("sendMessage", json={
-        "chat_id": CHAT_ID, "text": msg[:4096],
-        "parse_mode": "HTML", "disable_web_page_preview": True})
-
+def send_text(m):
+    return tg("sendMessage", json={"chat_id": CHAT_ID, "text": m[:4096],
+                                   "parse_mode": "HTML",
+                                   "disable_web_page_preview": True})
 
 def send_photo(path, caption=""):
     if not path or not os.path.exists(path):
         return send_text(caption)
     try:
         with open(path, "rb") as fh:
-            return tg("sendPhoto",
-                      data={"chat_id": CHAT_ID, "caption": caption[:1024],
-                            "parse_mode": "HTML"},
+            return tg("sendPhoto", data={"chat_id": CHAT_ID,
+                                         "caption": caption[:1024],
+                                         "parse_mode": "HTML"},
                       files={"photo": fh})
     except Exception as e:
-        print(f"!! sendPhoto error: {e}")
-        return send_text(caption)
+        print(f"!! sendPhoto: {e}"); return send_text(caption)
 
+# ------------------------------------------------------ human-like helpers --
+def human_pause(a=0.8, b=2.2):
+    time.sleep(random.uniform(a, b))
 
-# ----------------------------------------------------------------- proxies ---
-def fetch_free_proxies():
+def human_move_click(page, locator):
+    box = locator.bounding_box()
+    if box:
+        page.mouse.move(box["x"] + box["width"] * random.uniform(0.3, 0.7),
+                        box["y"] + box["height"] * random.uniform(0.3, 0.7),
+                        steps=random.randint(5, 15))
+    human_pause(0.3, 0.9)
+    locator.click()
+
+# -------------------------------------------------------------- proxies -----
+def fetch_candidates():
     found = set()
     for src in FREE_PROXY_SOURCES:
         try:
             r = requests.get(src, timeout=8)
             if r.status_code == 200:
-                for m in re.finditer(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", r.text):
-                    found.add("http://" + m.group(0))
+                found.update("http://" + m.group(0) for m in
+                             re.finditer(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b",
+                                         r.text))
         except Exception:
-            continue
-    return list(found)
-
+            pass
+    print(f"{len(found)} candidate proxies"); return list(found)
 
 def check_proxy(p):
     try:
+        t0 = time.time()
         r = requests.get("https://cems.cpcb.gov.in/public/",
                          proxies={"http": p, "https": p},
-                         timeout=8, verify=False)
-        return p if r.status_code == 200 else None
+                         timeout=6, verify=False,
+                         headers={"User-Agent": UA,
+                                  "Accept": "text/html,application/xhtml+xml",
+                                  "Accept-Language": "en-IN,en;q=0.9"})
+        if r.status_code == 200 and (time.time() - t0) < 5.5:
+            return (int((time.time() - t0) * 1000), p)
     except Exception:
-        return None
+        pass
+    return None
 
-
-def good_proxies(n=8):
-    cands = fetch_free_proxies()
-    print(f"Testing {len(cands)} free Indian proxies (8s each)…")
-    out = []
+def best_proxies():
+    if CEMS_PROXY:
+        return [CEMS_PROXY]
+    cands = fetch_candidates()
     if not cands:
-        return out
-    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
-        futs = {ex.submit(check_proxy, p): p for p in cands}
-        for fut in concurrent.futures.as_completed(futs):
-            res = fut.result()
-            if res:
-                out.append(res)
-                print(f"  ok: {res}")
-                if len(out) >= n:
-                    break
-    return out
+        return [None]
+    res = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as ex:
+        for r in ex.map(check_proxy, cands):
+            if r:
+                res.append(r)
+    res.sort()
+    out = [p for _, p in res[:MAX_ATTEMPTS]]
+    print(f"validated {len(res)}, using {out}")
+    return out or [None]
 
-
-# ------------------------------------------------------------ browser wiretap
-def capture(proxy_server):
-    """Return list of (url, body) for every XHR/fetch response seen."""
-    captured = []
+# ------------------------------------------------------------- the flow -----
+def attempt(proxy_server):
     with sync_playwright() as p:
-        kw = dict(headless=True, args=[
+        kw = dict(headless=False, args=[            # headed → human-like
             "--no-sandbox", "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage", "--ignore-certificate-errors"])
+            "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled",
+            "--window-size=1366,768", "--lang=en-IN",
+            "--ignore-certificate-errors"])
         if proxy_server:
             kw["proxy"] = {"server": proxy_server}
         browser = p.chromium.launch(**kw)
-        ctx = browser.new_context(user_agent=UA,
-                                  viewport={"width": 1920, "height": 1080},
-                                  ignore_https_errors=True)
+        ctx = browser.new_context(
+            user_agent=UA, locale="en-IN", timezone_id="Asia/Kolkata",
+            viewport={"width": 1366, "height": 768},
+            geolocation={"latitude": 20.59, "longitude": 78.96},
+            permissions=["geolocation"], ignore_https_errors=True,
+            color_scheme="light")
         page = ctx.new_page()
         page.set_default_timeout(NAV_TIMEOUT_MS)
+        stealth_sync(page)                          # hide automation markers
 
-        if BLOCK_ASSETS:
-            page.route("**/*", lambda route: route.abort()
-                       if route.request.resource_type in ("image", "media", "font")
-                       else route.continue_())
-
-        def on_response(resp):
+        def snap(name):
             try:
-                if resp.request.resource_type not in ("xhr", "fetch"):
-                    return
-                txt = resp.text()
-                if txt and ("{" in txt or "[" in txt):
-                    captured.append((resp.url, txt))
-            except Exception:
-                pass
-
-        page.on("response", on_response)
+                page.screenshot(path=f"{name}.png", full_page=True)
+                open(f"{name}.html", "w", encoding="utf-8").write(page.content())
+            except Exception as e:
+                print(f"snap {name}: {e}")
 
         try:
-            page.goto(DASH_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            page.goto(DASH_URL, wait_until="domcontentloaded")
+            page.wait_for_selector("table, mat-table, .mat-table", timeout=30000)
+            human_pause(2.5, 4.5)                   # read the page like a human
+            snap("1_dashboard")
+
+            row = page.locator("tr, .ag-row", has_text=INDUSTRY).first
+            row.wait_for(timeout=25000)
+            row.scroll_into_view_if_needed()
+            human_pause(1.0, 2.0)
+
+            # eye / view icon in the Actions cell
+            opened = False
+            for sel in ["[aria-label*='iew' i]", "[title*='iew' i]",
+                        "mat-icon:has-text('visibility')", "button:has(mat-icon)",
+                        "a:has(mat-icon)", "button:has(i.material-icons)",
+                        "button:has(svg)"]:
+                try:
+                    btns = row.locator(sel)
+                    for i in range(min(btns.count(), 6)):
+                        b = btns.nth(i)
+                        if b.is_visible():
+                            human_move_click(page, b)
+                            opened = True
+                            break
+                    if opened:
+                        break
+                except Exception:
+                    continue
+            if not opened:
+                human_move_click(page, row)         # last resort: row click
+            human_pause(3.0, 5.0)
+            snap("2_site_info")
+
+            # Emissions tab
+            tab = page.locator("[role=tab]:has-text('mission'), "
+                               "a:has-text('Emission'), "
+                               "button:has-text('Emission'), "
+                               "li:has-text('Emission')").first
+            tab.wait_for(timeout=20000)
+            human_pause(0.8, 1.8)
+            human_move_click(page, tab)
+            human_pause(5.0, 7.5)                   # let Angular render data
+            snap("3_emissions")
+
+            rows = []
+            tables = page.locator("table")
+            for t in range(min(tables.count(), 6)):
+                html = tables.nth(t).inner_html()
+                if re.search(r"mg|µg|ug", html, re.I):
+                    for tr in tables.nth(t).locator("tr").all():
+                        cells = [c.strip() for c in
+                                 tr.locator("th, td").all_inner_texts()]
+                        if cells:
+                            rows.append(cells)
+            page_text = page.locator("body").inner_text()
+            browser.close()
+            if rows:
+                return "data", (rows, page_text)
+            return "error", ("emissions table not found", None)
         except Exception as e:
-            print(f"goto warning: {e}")
+            try: snap("error")
+            except Exception: pass
+            try: browser.close()
+            except Exception: pass
+            return "error", (f"{type(e).__name__}: {e}", None)
 
-        # best-effort: open the Emissions tab so its XHR fires
-        for sel in ["text=/emission/i", "[role=tab]:has-text('Emission')",
-                    "a:has-text('Emission')"]:
+def scrape(proxies):
+    errors = []
+    for i, prox in enumerate(proxies, 1):
+        print(f"--- attempt {i}/{len(proxies)} via {prox or 'DIRECT'} ---")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             try:
-                loc = page.locator(sel).first
-                if loc.count():
-                    loc.click(timeout=5000)
-                    page.wait_for_timeout(3000)
-                    break
-            except Exception:
-                pass
+                kind, payload = ex.submit(attempt, prox).result(PER_ATTEMPT_S)
+            except concurrent.futures.TimeoutError:
+                errors.append(f"attempt {i}: timed out"); continue
+        if kind == "data":
+            return payload
+        errors.append(f"attempt {i} ({prox}): {payload[0]}")
+    return None, errors
 
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            page.wait_for_timeout(2000)
-            if captured:
-                break
-
-        browser.close()
-    return captured
-
-
-# ---------------------------------------------------------------- parsing ----
-VALUE_KEYS = ("value", "reading", "val", "measuredvalue", "finalvalue",
-              "concentration", "avg", "average", "result")
-UNIT_KEYS = ("unit", "units", "uom")
-TIME_KEYS = ("timestamp", "datetime", "receivedtime", "lastreceived",
-             "last_received", "lttime", "sttime", "time", "date")
-PARAM_KEYS = ("parameter", "param", "parametername", "pollutant", "name")
-
-
-def norm_unit(u):
-    if not u:
-        return ""
-    return (str(u).lower().replace("µ", "u").replace("μ", "u")
-            .replace("³", "3").replace(" ", ""))
-
-
+# ------------------------------------------------------------- parsing ------
 def is_na(v):
-    if v is None:
-        return True
-    return str(v).strip().lower() in (
-        "", "na", "n/a", "null", "none", "nan", "-", "--", "not available")
+    return str(v).strip().lower() in ("", "na", "n/a", "null", "none",
+                                      "nan", "-", "--", "not available")
 
-
-def get_field(d, keys):
-    low = {str(k).lower(): v for k, v in d.items()}
-    for k in keys:
-        if k in low and low[k] not in (None, ""):
-            return low[k]
-    return None
-
-
-def walk(node, out):
-    if isinstance(node, dict):
-        vk = any(k in {str(x).lower() for x in node} for k in VALUE_KEYS)
-        uk = any(k in {str(x).lower() for x in node} for k in UNIT_KEYS)
-        if vk and uk:
-            out.append(node)
-        for v in node.values():
-            walk(v, out)
-    elif isinstance(node, list):
-        for v in node:
-            walk(v, out)
-
-
-def parse_dt(v):
-    if v is None or v == "":
-        return None
-    if isinstance(v, (int, float)) or (isinstance(v, str) and re.fullmatch(r"\d{10,13}", v.strip())):
-        n = float(v)
-        if n > 1e12:           # milliseconds
-            n /= 1000.0
-        try:
-            return datetime.fromtimestamp(n, IST)
-        except Exception:
-            return None
-    s = str(v).strip().replace("/", "-")
+def parse_dt(s):
+    if not s: return None
     try:
         from dateutil import parser as dparser
-        dt = dparser.parse(s, dayfirst=True)
+        dt = dparser.parse(s.strip().replace("/", "-"), dayfirst=True)
         return IST.localize(dt) if dt.tzinfo is None else dt.astimezone(IST)
     except Exception:
         return None
 
-
-def parse_all(captured):
-    readings = []
-    for url, text in captured:
-        try:
-            data = json.loads(text)
-        except Exception:
-            continue
-        bucket = []
-        walk(data, bucket)
-        for rec in bucket:
-            readings.append((url, rec))
-    return readings
-
-
-def choose_emission(readings):
-    """Pick the most emissions-like mg/m3 record (paired value+unit+time)."""
+def pick_reading(rows):
     best = None
-    for url, rec in readings:
-        nu = norm_unit(get_field(rec, UNIT_KEYS))
-        if "mg/m3" not in nu and "ug/m3" not in nu and "mg/nm3" not in nu:
-            continue
-        name = get_field(rec, PARAM_KEYS) or ""
-        score = 2 if "mg/m3" in nu else 1
-        if parse_dt(get_field(rec, TIME_KEYS)):
-            score += 3
-        if any(p in str(name).lower() for p in
-               ("pm", "so2", "nox", "co", "stack", "spm", "tpm")):
-            score += 1
-        cand = {"value": get_field(rec, VALUE_KEYS), "unit": get_field(rec, UNIT_KEYS),
-                "dt": parse_dt(get_field(rec, TIME_KEYS)), "name": name,
-                "url": url, "score": score}
-        if best is None or cand["score"] > best["score"]:
-            best = cand
+    for cells in rows:
+        if len(cells) < 3: continue
+        value = unit = dt = None
+        for c in cells:
+            m = re.search(r"(\d+(?:\.\d+)?)\s*(mg/m|µg/m|ug/m|mg/nm)", c, re.I)
+            if m and value is None:
+                value, unit = m.group(1), m.group(2)
+            if re.search(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}:\d{2}", c) and not dt:
+                dt = parse_dt(c)
+        if value and dt:
+            cand = {"value": value, "unit": unit or "mg/m3", "dt": dt,
+                    "raw": " | ".join(cells)}
+            if best is None or cand["dt"] > best["dt"]:
+                best = cand
     return best
 
-
-# --------------------------------------------------------------- screenshot --
-def render_local(html, out="dashboard_snapshot.png"):
-    path = os.path.abspath("local_dashboard.html")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
-    try:
-        with sync_playwright() as p:
-            b = p.chromium.launch(headless=True,
-                                  args=["--no-sandbox", "--disable-dev-shm-usage"])
-            pg = b.new_page(viewport={"width": 1000, "height": 700})
-            pg.goto("file://" + path)
-            pg.screenshot(path=out, full_page=True)
-            b.close()
-        return out
-    except Exception as e:
-        print(f"screenshot failed: {e}")
-        return None
-
-
-def make_html(value, when, is_alert):
-    color = "#d9363e" if is_alert else "#52c41a"
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-body{{font-family:Segoe UI,Arial,sans-serif;background:#f0f2f5;padding:40px;margin:0}}
-.card{{background:#fff;border-radius:12px;padding:28px;max-width:760px;margin:auto;
-box-shadow:0 8px 24px rgba(0,0,0,.1);border-top:6px solid #1890ff}}
-h1{{color:#1890ff;font-size:24px;margin:0 0 16px}}
-.w{{display:flex;gap:20px}} .b{{flex:1;background:#fafafa;border:1px solid #e8e8e8;
-border-radius:8px;padding:18px;text-align:center}}
-.t{{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px}}
-.v{{font-size:32px;font-weight:700;color:{color}}}
-</style></head><body><div class="card">
-<h1>🏭 SIDDHI VINAYAK PROCESS — CEMS</h1>
-<div class="w"><div class="b"><div class="t">Emission</div><div class="v">{value}</div></div>
-<div class="b"><div class="t">Last Received</div>
-<div class="v" style="font-size:20px">{when}</div></div></div></div></body></html>"""
-
-
-# -------------------------------------------------------------------- main ---
-def dump_discovery(captured):
-    lines = []
-    for url, body in captured:
-        endpoint = url.split("?")[0]
-        lines.append(f"{url}\n  -> {body[:800]}\n")
-    text = "\n".join(lines) or "NO XHR/fetch responses captured."
-    with open("discovered_endpoints.txt", "w", encoding="utf-8") as f:
-        f.write(text)
-    print(text[:6000])
-    # also ship the top candidates straight to Telegram
-    seen = []
-    for url, _ in captured:
-        e = url.split("?")[0]
-        if e not in seen:
-            seen.append(e)
-    if seen:
-        send_text("🔎 <b>XHR endpoints seen</b>\n" + "\n".join(f"<code>{e}</code>" for e in seen[:25]))
-
-
+# ---------------------------------------------------------------- main ------
 def main():
-    proxies = [PROXY_SERVER] if PROXY_SERVER else good_proxies(8)
-    if not proxies:
-        print("No proxy available — trying direct (works only from an Indian IP).")
-        proxies = [None]
-
-    captured = []
-    for i, prox in enumerate(proxies, 1):
-        print(f"--- attempt {i}/{len(proxies)}  proxy={prox} ---")
-        try:
-            captured = capture(prox)
-        except Exception as e:
-            print(f"capture failed: {e}")
-            captured = []
-        if captured:
-            break
-
-    if DISCOVER:
-        dump_discovery(captured)
-        return
-
     now = datetime.now(IST)
-    reading = choose_emission(parse_all(captured))
+    rows, errors = scrape(best_proxies())
+    if rows is None:
+        send_text("❌ <b>CPCB Monitor — all attempts failed</b>\n" +
+                  "\n".join(f"• {e}" for e in errors[:6]))
+        print("FAILED:", errors); return
 
+    reading = pick_reading(rows)
     if reading is None:
-        send_text(
-            "⚠️ <b>CPCB Monitor: no emission reading found</b>\n\n"
-            f"Captured <b>{len(captured)}</b> XHR responses, none with an mg/m³ value.\n"
-            "Re-run with <code>DISCOVER=1</code> to dump the payloads.")
-        print("FAILED: no mg/m3 reading parsed.")
+        send_text("⚠️ <b>Page loaded but no emission reading parsed.</b> "
+                  "Check artifacts (3_emissions.png/html).")
         return
 
-    value, dt = reading["value"], reading["dt"]
-    na = is_na(value)
-    when = dt.strftime("%d %b %Y, %I:%M %p IST") if dt else "Unknown"
-
+    na = is_na(reading["value"])
+    when = reading["dt"].strftime("%d %b %Y, %I:%M %p IST")
+    delay_h = (now - reading["dt"]).total_seconds() / 3600.0
     reasons = []
-    if na:
-        reasons.append(f"• Reading is <b>NA</b> ({reading['unit'] or 'mg/m³'})")
-    if dt is None:
-        reasons.append("• Could not read the sample timestamp")
-    else:
-        delay = (now - dt).total_seconds() / 3600.0
-        if delay >= DELAY_LIMIT_HOURS:
-            reasons.append(f"• Telemetry delayed <b>{int(delay)}h "
-                           f"{int((delay % 1) * 60)}m</b> (last: {when})")
+    if na: reasons.append("• Reading is <b>NA</b>")
+    if delay_h >= DELAY_LIMIT_HOURS:
+        reasons.append(f"• Timestamp <b>{delay_h:.1f}h</b> old")
 
-    is_alert = bool(reasons)
-    head = "⚠️ <b>CPCB Emission Alert</b>" if is_alert else "✅ <b>CPCB Monitor — healthy</b>"
-    body = (f"{head}\n\n🏭 <b>Industry:</b> SIDDHI VINAYAK PROCESS\n\n"
-            f"<b>Reading:</b> {'NA' if na else str(value)} {reading['unit'] or 'mg/m³'}\n"
-            f"<b>Last Received:</b> {when}\n")
-    if reading.get("name"):
-        body += f"<b>Parameter:</b> {reading['name']}\n"
-    if reasons:
-        body += "\n<b>Triggers:</b>\n" + "\n".join(reasons) + "\n"
+    head = "⚠️ <b>CPCB Emission Alert</b>" if reasons else "✅ <b>CPCB Monitor — healthy</b>"
+    body = (f"{head}\n\n🏭 <b>Industry:</b> SIDDHI VINAYAK PROCESS\n"
+            f"<b>Reading:</b> {'NA' if na else reading['value']} {reading['unit']}\n"
+            f"<b>Last Received:</b> {when}\n<b>Data age:</b> {delay_h:.1f}h\n")
+    if reasons: body += "\n<b>Triggers:</b>\n" + "\n".join(reasons) + "\n"
     body += f"\n🕒 Report: {now.strftime('%I:%M %p, %d %b %Y')} IST"
 
-    if not is_alert and not ALWAYS_NOTIFY:
-        print("Healthy and ALWAYS_NOTIFY=0 — no message sent.")
-        return
-
-    shot = render_local(make_html(("NA" if na else str(value)), when, is_alert))
-    send_photo(shot, body) if shot else send_text(body)
-    print(f"Sent. alert={is_alert} na={na} delay_ok={not reasons}")
-
+    send_photo("3_emissions.png" if os.path.exists("3_emissions.png") else None, body)
+    print("Done. alert =", bool(reasons))
 
 if __name__ == "__main__":
     main()
