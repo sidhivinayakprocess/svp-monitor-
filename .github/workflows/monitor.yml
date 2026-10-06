@@ -19,7 +19,8 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install requests python-dateutil pytz
+          pip install playwright requests python-dateutil pytz
+          playwright install --with-deps chromium
 
       - name: Run CPCB Check
         env:
