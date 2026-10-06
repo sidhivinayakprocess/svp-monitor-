@@ -1,7 +1,7 @@
-import concurrent.futures
 import os
 import random
 import re
+import threading
 import time
 from datetime import datetime
 
@@ -9,7 +9,7 @@ import pytz
 import requests
 import urllib3
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+from playwright_stealth import Stealth
 
 urllib3.disable_warnings()
 
@@ -38,7 +38,8 @@ FREE_PROXY_SOURCES = [
 # ------------------------------------------------------------ telegram ------
 def tg(method, **kwargs):
     if not BOT_TOKEN or not CHAT_ID:
-        print("!! Telegram creds missing — skipping notify"); return False
+        print("!! Telegram creds missing — skipping notify")
+        return False
     try:
         r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
                           timeout=30, **kwargs)
@@ -47,7 +48,8 @@ def tg(method, **kwargs):
             print(f"!! Telegram {method}: {r.status_code} {r.text[:200]}")
         return ok
     except Exception as e:
-        print(f"!! Telegram error: {e}"); return False
+        print(f"!! Telegram error: {e}")
+        return False
 
 def send_text(m):
     return tg("sendMessage", json={"chat_id": CHAT_ID, "text": m[:4096],
@@ -64,7 +66,8 @@ def send_photo(path, caption=""):
                                          "parse_mode": "HTML"},
                       files={"photo": fh})
     except Exception as e:
-        print(f"!! sendPhoto: {e}"); return send_text(caption)
+        print(f"!! sendPhoto: {e}")
+        return send_text(caption)
 
 # ------------------------------------------------------ human-like helpers --
 def human_pause(a=0.8, b=2.2):
@@ -79,6 +82,24 @@ def human_move_click(page, locator):
     human_pause(0.3, 0.9)
     locator.click()
 
+def run_with_timeout(fn, timeout_s, *args):
+    """Run fn(*args) in a daemon thread; give up after timeout_s.
+    Daemon threads never block process exit, so a hung browser can't stall us."""
+    box = {}
+    def target():
+        try:
+            box["val"] = fn(*args)
+        except Exception as e:          # noqa: BLE001
+            box["err"] = e
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise TimeoutError(f"attempt exceeded {timeout_s}s")
+    if "err" in box:
+        raise box["err"]
+    return box["val"]
+
 # -------------------------------------------------------------- proxies -----
 def fetch_candidates():
     found = set()
@@ -91,7 +112,8 @@ def fetch_candidates():
                                          r.text))
         except Exception:
             pass
-    print(f"{len(found)} candidate proxies"); return list(found)
+    print(f"{len(found)} candidate proxies")
+    return list(found)
 
 def check_proxy(p):
     try:
@@ -127,9 +149,10 @@ def best_proxies():
 # ------------------------------------------------------------- the flow -----
 def attempt(proxy_server):
     with sync_playwright() as p:
-        kw = dict(headless=False, args=[            # headed → human-like
+        kw = dict(headless=False, args=[
             "--no-sandbox", "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
             "--window-size=1366,768", "--lang=en-IN",
             "--ignore-certificate-errors"])
         if proxy_server:
@@ -141,9 +164,9 @@ def attempt(proxy_server):
             geolocation={"latitude": 20.59, "longitude": 78.96},
             permissions=["geolocation"], ignore_https_errors=True,
             color_scheme="light")
+        Stealth().apply_stealth_sync(ctx)
         page = ctx.new_page()
         page.set_default_timeout(NAV_TIMEOUT_MS)
-        stealth_sync(page)                          # hide automation markers
 
         def snap(name):
             try:
@@ -154,8 +177,9 @@ def attempt(proxy_server):
 
         try:
             page.goto(DASH_URL, wait_until="domcontentloaded")
-            page.wait_for_selector("table, mat-table, .mat-table", timeout=30000)
-            human_pause(2.5, 4.5)                   # read the page like a human
+            page.wait_for_selector("table, mat-table, .mat-table, .ag-root",
+                                   timeout=30000)
+            human_pause(2.5, 4.5)
             snap("1_dashboard")
 
             row = page.locator("tr, .ag-row", has_text=INDUSTRY).first
@@ -166,9 +190,9 @@ def attempt(proxy_server):
             # eye / view icon in the Actions cell
             opened = False
             for sel in ["[aria-label*='iew' i]", "[title*='iew' i]",
-                        "mat-icon:has-text('visibility')", "button:has(mat-icon)",
-                        "a:has(mat-icon)", "button:has(i.material-icons)",
-                        "button:has(svg)"]:
+                        "mat-icon:has-text('visibility')",
+                        "button:has(mat-icon)", "a:has(mat-icon)",
+                        "button:has(i.material-icons)", "button:has(svg)"]:
                 try:
                     btns = row.locator(sel)
                     for i in range(min(btns.count(), 6)):
@@ -182,7 +206,7 @@ def attempt(proxy_server):
                 except Exception:
                     continue
             if not opened:
-                human_move_click(page, row)         # last resort: row click
+                human_move_click(page, row)   # last resort: row click
             human_pause(3.0, 5.0)
             snap("2_site_info")
 
@@ -194,7 +218,7 @@ def attempt(proxy_server):
             tab.wait_for(timeout=20000)
             human_pause(0.8, 1.8)
             human_move_click(page, tab)
-            human_pause(5.0, 7.5)                   # let Angular render data
+            human_pause(5.0, 7.5)
             snap("3_emissions")
 
             rows = []
@@ -207,30 +231,37 @@ def attempt(proxy_server):
                                  tr.locator("th, td").all_inner_texts()]
                         if cells:
                             rows.append(cells)
-            page_text = page.locator("body").inner_text()
             browser.close()
             if rows:
-                return "data", (rows, page_text)
-            return "error", ("emissions table not found", None)
+                return "data", rows
+            return "error", "emissions table not found"
         except Exception as e:
-            try: snap("error")
-            except Exception: pass
-            try: browser.close()
-            except Exception: pass
-            return "error", (f"{type(e).__name__}: {e}", None)
+            try:
+                snap("error")
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return "error", f"{type(e).__name__}: {e}"
 
 def scrape(proxies):
     errors = []
     for i, prox in enumerate(proxies, 1):
         print(f"--- attempt {i}/{len(proxies)} via {prox or 'DIRECT'} ---")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            try:
-                kind, payload = ex.submit(attempt, prox).result(PER_ATTEMPT_S)
-            except concurrent.futures.TimeoutError:
-                errors.append(f"attempt {i}: timed out"); continue
+        try:
+            kind, payload = run_with_timeout(attempt, PER_ATTEMPT_S, prox)
+        except TimeoutError:
+            errors.append(f"attempt {i} ({prox or 'DIRECT'}): timed out "
+                          f"after {PER_ATTEMPT_S}s")
+            continue
+        except Exception as e:
+            errors.append(f"attempt {i} ({prox or 'DIRECT'}): {e}")
+            continue
         if kind == "data":
-            return payload
-        errors.append(f"attempt {i} ({prox}): {payload[0]}")
+            return payload, errors
+        errors.append(f"attempt {i} ({prox or 'DIRECT'}): {payload}")
     return None, errors
 
 # ------------------------------------------------------------- parsing ------
@@ -239,7 +270,8 @@ def is_na(v):
                                       "nan", "-", "--", "not available")
 
 def parse_dt(s):
-    if not s: return None
+    if not s:
+        return None
     try:
         from dateutil import parser as dparser
         dt = dparser.parse(s.strip().replace("/", "-"), dayfirst=True)
@@ -250,7 +282,8 @@ def parse_dt(s):
 def pick_reading(rows):
     best = None
     for cells in rows:
-        if len(cells) < 3: continue
+        if len(cells) < 3:
+            continue
         value = unit = dt = None
         for c in cells:
             m = re.search(r"(\d+(?:\.\d+)?)\s*(mg/m|µg/m|ug/m|mg/nm)", c, re.I)
@@ -272,7 +305,8 @@ def main():
     if rows is None:
         send_text("❌ <b>CPCB Monitor — all attempts failed</b>\n" +
                   "\n".join(f"• {e}" for e in errors[:6]))
-        print("FAILED:", errors); return
+        print("FAILED:", errors)
+        return
 
     reading = pick_reading(rows)
     if reading is None:
@@ -284,15 +318,18 @@ def main():
     when = reading["dt"].strftime("%d %b %Y, %I:%M %p IST")
     delay_h = (now - reading["dt"]).total_seconds() / 3600.0
     reasons = []
-    if na: reasons.append("• Reading is <b>NA</b>")
+    if na:
+        reasons.append("• Reading is <b>NA</b>")
     if delay_h >= DELAY_LIMIT_HOURS:
         reasons.append(f"• Timestamp <b>{delay_h:.1f}h</b> old")
 
-    head = "⚠️ <b>CPCB Emission Alert</b>" if reasons else "✅ <b>CPCB Monitor — healthy</b>"
+    head = ("⚠️ <b>CPCB Emission Alert</b>" if reasons
+            else "✅ <b>CPCB Monitor — healthy</b>")
     body = (f"{head}\n\n🏭 <b>Industry:</b> SIDDHI VINAYAK PROCESS\n"
             f"<b>Reading:</b> {'NA' if na else reading['value']} {reading['unit']}\n"
             f"<b>Last Received:</b> {when}\n<b>Data age:</b> {delay_h:.1f}h\n")
-    if reasons: body += "\n<b>Triggers:</b>\n" + "\n".join(reasons) + "\n"
+    if reasons:
+        body += "\n<b>Triggers:</b>\n" + "\n".join(reasons) + "\n"
     body += f"\n🕒 Report: {now.strftime('%I:%M %p, %d %b %Y')} IST"
 
     send_photo("3_emissions.png" if os.path.exists("3_emissions.png") else None, body)
