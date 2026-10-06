@@ -1,29 +1,50 @@
-name: CPCB 30-Min Emission Monitor
+name: CPCB Emission Monitor
 
 on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
+    inputs:
+      discover:
+        description: 'Set to 1 to dump all XHR endpoints'
+        default: '0'
+
+concurrency:
+  group: cpcb-monitor
+  cancel-in-progress: false
 
 jobs:
   check-cpcb:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: Install deps
         run: |
           pip install playwright requests python-dateutil pytz
           playwright install --with-deps chromium
 
-      - name: Run CPCB Check
+      - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CEMS_PROXY: ${{ secrets.CEMS_PROXY }}
+          DISCOVER: ${{ github.event.inputs.discover || '0' }}
+          ALWAYS_NOTIFY: '1'
         run: python monitor.py
+
+      - name: Upload discovery log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: discovery-${{ github.run_number }}
+          path: |
+            discovered_endpoints.txt
+            dashboard_snapshot.png
+            local_dashboard.html
+          if-no-files-found: ignore
