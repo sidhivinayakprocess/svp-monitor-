@@ -19,12 +19,13 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 CEMS_PROXY = os.environ.get("CEMS_PROXY")   # optional; else free Indian proxies
 INDUSTRY = "SIDDHI VINAYAK PROCESS"
+INDUSTRY_RX = re.compile(r"SIDDHI\s+VINAYAK", re.I)
 DASH_URL = ("https://cems.cpcb.gov.in/public/#/"
             "l/realtime-connectivity-status-dashboard")
 DELAY_LIMIT_HOURS = 1.0
 NAV_TIMEOUT_MS = 45000
 PER_ATTEMPT_S = 150
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = 5
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
@@ -35,6 +36,9 @@ FREE_PROXY_SOURCES = [
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-Lists/master/http.txt",
 ]
+GEONODE_URL = ("https://proxylist.geonode.com/api/proxy-list?limit=500&page=1"
+               "&sort_by=lastChecked&sort_type=desc&country=IN"
+               "&protocols=http%2Chttps")
 
 # ------------------------------------------------------------ telegram ------
 def tg(method, **kwargs):
@@ -84,8 +88,6 @@ def human_move_click(page, locator):
     locator.click()
 
 def run_with_timeout(fn, timeout_s, *args):
-    """Run fn(*args) in a daemon thread; give up after timeout_s.
-    Daemon threads never block process exit, so a hung browser can't stall us."""
     box = {}
     def target():
         try:
@@ -103,18 +105,50 @@ def run_with_timeout(fn, timeout_s, *args):
 
 # -------------------------------------------------------------- proxies -----
 def fetch_candidates():
-    found = set()
+    """Return {ip: proxy_url} from all sources."""
+    urls = set()
     for src in FREE_PROXY_SOURCES:
         try:
             r = requests.get(src, timeout=8)
             if r.status_code == 200:
-                found.update("http://" + m.group(0) for m in
-                             re.finditer(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b",
-                                         r.text))
+                urls.update("http://" + m.group(0) for m in
+                            re.finditer(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b",
+                                        r.text))
         except Exception:
             pass
-    print(f"{len(found)} candidate proxies")
-    return list(found)
+    try:
+        r = requests.get(GEONODE_URL, timeout=10)
+        if r.status_code == 200:
+            for d in r.json().get("data", []):
+                if d.get("ip") and d.get("port"):
+                    urls.add(f"http://{d['ip']}:{d['port']}")
+    except Exception:
+        pass
+    cands = {}
+    for u in urls:
+        ip = u.split("//")[1].split(":")[0]
+        cands[ip] = u
+    print(f"{len(cands)} candidate proxies")
+    return cands
+
+def indian_ips(ips):
+    """Keep only India-geolocated IPs (ip-api.com free batch API, 100/req)."""
+    keep = set()
+    batches = [ips[i:i + 100] for i in range(0, min(len(ips), 600), 100)]
+    for batch in batches:
+        try:
+            r = requests.post(
+                "http://ip-api.com/batch?fields=query,status,countryCode",
+                json=batch, timeout=12)
+            if r.status_code == 200:
+                for item in r.json():
+                    if (item and item.get("status") == "success"
+                            and item.get("countryCode") == "IN"):
+                        keep.add(item.get("query"))
+        except Exception:
+            pass
+    print(f"geolocation: {len(keep)}/{len(ips)} are IN")
+    return keep
 
 def check_proxy(p):
     try:
@@ -137,9 +171,11 @@ def best_proxies():
     cands = fetch_candidates()
     if not cands:
         return [None]
+    indian = indian_ips(list(cands))
+    shortlist = [cands[ip] for ip in indian] or list(cands.values())[:50]
     res = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=80) as ex:
-        for r in ex.map(check_proxy, cands):
+        for r in ex.map(check_proxy, shortlist):
             if r:
                 res.append(r)
     res.sort()
@@ -176,24 +212,52 @@ def attempt(proxy_server):
             except Exception as e:
                 print(f"snap {name}: {e}")
 
+        def page_diag():
+            """Self-diagnosis string appended to any error."""
+            try:
+                return (f" | url={page.url} | title={page.title()!r} | "
+                        f"body={page.locator('body').inner_text()[:250]!r}")
+            except Exception:
+                return " | (could not read page state)"
+
         try:
             page.goto(DASH_URL, wait_until="domcontentloaded")
-            page.wait_for_selector("table, mat-table, .mat-table, .ag-root",
-                                   timeout=30000)
-            human_pause(2.5, 4.5)
+            try:
+                page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            human_pause(8.0, 12.0)              # let the SPA render
             snap("1_dashboard")
 
-            row = page.locator("tr, .ag-row", has_text=INDUSTRY).first
-            row.wait_for(timeout=25000)
-            row.scroll_into_view_if_needed()
+            # find the industry by visible text — no table-type assumption
+            cell = page.get_by_text(INDUSTRY_RX).first
+            cell.wait_for(timeout=25000)
+            row = None
+            for anc in ["xpath=ancestor::tr[1]",
+                        "xpath=ancestor::*[@role='row'][1]",
+                        "xpath=ancestor::div[contains(@class,'row')][1]"]:
+                try:
+                    loc = cell.locator(anc)
+                    if loc.count():
+                        row = loc.first
+                        break
+                except Exception:
+                    continue
+            if row is None:
+                row = cell
+            try:
+                row.scroll_into_view_if_needed()
+            except Exception:
+                pass
             human_pause(1.0, 2.0)
 
-            # eye / view icon in the Actions cell
+            # eye / view icon inside the row (or the text itself)
             opened = False
             for sel in ["[aria-label*='iew' i]", "[title*='iew' i]",
                         "mat-icon:has-text('visibility')",
                         "button:has(mat-icon)", "a:has(mat-icon)",
-                        "button:has(i.material-icons)", "button:has(svg)"]:
+                        "button:has(i.material-icons)", "button:has(svg)",
+                        "button", "a"]:
                 try:
                     btns = row.locator(sel)
                     for i in range(min(btns.count(), 6)):
@@ -207,15 +271,12 @@ def attempt(proxy_server):
                 except Exception:
                     continue
             if not opened:
-                human_move_click(page, row)   # last resort: row click
+                human_move_click(page, row)
             human_pause(3.0, 5.0)
             snap("2_site_info")
 
-            # Emissions tab
-            tab = page.locator("[role=tab]:has-text('mission'), "
-                               "a:has-text('Emission'), "
-                               "button:has-text('Emission'), "
-                               "li:has-text('Emission')").first
+            # Emissions tab by visible text
+            tab = page.get_by_text(re.compile(r"Emission", re.I)).first
             tab.wait_for(timeout=20000)
             human_pause(0.8, 1.8)
             human_move_click(page, tab)
@@ -232,11 +293,11 @@ def attempt(proxy_server):
                                  tr.locator("th, td").all_inner_texts()]
                         if cells:
                             rows.append(cells)
+            page_text = page.locator("body").inner_text()
             browser.close()
-            if rows:
-                return "data", rows
-            return "error", "emissions table not found"
+            return "data", (rows, page_text)
         except Exception as e:
+            diag = page_diag()
             try:
                 snap("error")
             except Exception:
@@ -245,7 +306,7 @@ def attempt(proxy_server):
                 browser.close()
             except Exception:
                 pass
-            return "error", f"{type(e).__name__}: {e}"
+            return "error", f"{type(e).__name__}: {e}{diag}"
 
 def scrape(proxies):
     errors = []
@@ -263,6 +324,7 @@ def scrape(proxies):
         if kind == "data":
             return payload, errors
         errors.append(f"attempt {i} ({prox or 'DIRECT'}): {payload}")
+        print(f"failed: {payload[:200]}")
     return None, errors
 
 # ------------------------------------------------------------- parsing ------
@@ -280,9 +342,9 @@ def parse_dt(s):
     except Exception:
         return None
 
-def pick_reading(rows):
+def pick_reading(rows, page_text=""):
     best = None
-    for cells in rows:
+    for cells in rows or []:
         if len(cells) < 3:
             continue
         value = unit = dt = None
@@ -297,22 +359,35 @@ def pick_reading(rows):
                     "raw": " | ".join(cells)}
             if best is None or cand["dt"] > best["dt"]:
                 best = cand
-    return best
+    if best or not page_text:
+        return best
+    # fallback: parse the raw page text
+    vals = re.findall(r"(\d+(?:\.\d+)?)\s*(mg/m³|mg/Nm³|µg/m³|ug/m³"
+                      r"|mg/m3|ug/m3)", page_text, re.I)
+    times = re.findall(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}[ ,]+\d{1,2}:\d{2}"
+                       r"(?::\d{2})?(?:\s*[APap]\.?[Mm])?", page_text)
+    if vals and times:
+        dts = [d for d in (parse_dt(t) for t in times) if d]
+        if dts:
+            return {"value": vals[0][0], "unit": vals[0][1].replace("³", "3"),
+                    "dt": max(dts), "raw": page_text[:200]}
+    return None
 
 # ---------------------------------------------------------------- main ------
 def main():
     now = datetime.now(IST)
-    rows, errors = scrape(best_proxies())
-    if rows is None:
+    payload, errors = scrape(best_proxies())
+    if payload is None:
         send_text("❌ <b>CPCB Monitor — all attempts failed</b>\n" +
-                  "\n".join(f"• {e}" for e in errors[:6]))
+                  "\n".join(f"• {e[:350]}" for e in errors[:6]))
         print("FAILED:", errors)
         return
 
-    reading = pick_reading(rows)
+    rows, page_text = payload
+    reading = pick_reading(rows, page_text)
     if reading is None:
-        send_text("⚠️ <b>Page loaded but no emission reading parsed.</b> "
-                  "Check artifacts (3_emissions.png/html).")
+        send_text("⚠️ <b>Page loaded but no emission reading parsed.</b>\n"
+                  f"Page title: {page_text[:150]}")
         return
 
     na = is_na(reading["value"])
